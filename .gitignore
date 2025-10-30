@@ -1,6 +1,9 @@
 # Fuzzer output files
 fuzzer_output/
 
+# run_fuzzer.sh
+run_fuzzer.sh
+
 # Core dumps
 core
 core.*

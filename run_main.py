@@ -10,6 +10,9 @@ from pwn import process, remote, gdb, args, context, u64, asm
 context.log_level = 'error'  # Reduce pwn noise
 context.update(arch='amd64', os='linux')
 
+# Debug flag - set to True to print every iteration's payload
+DEBUG_PRINT_PAYLOADS = False
+
 BINARIES_PATH = (Path(__file__).parent / "binaries").resolve()
 INPUTS_PATH = (Path(__file__).parent / "example_inputs").resolve()
 OUTPUT_PATH = (Path(__file__).parent / "fuzzer_output").resolve()
@@ -316,10 +319,18 @@ def fuzz_binary(binary_name, max_time=60):
         
         iterations += 1
         
+        if DEBUG_PRINT_PAYLOADS:
+            print(f"[DEBUG] Iteration {iterations}: Sending {len(mutated)} bytes")
+            if len(mutated) <= 100:
+                print(f"[DEBUG] Payload: {mutated}")
+            else:
+                print(f"[DEBUG] Payload (first 100 bytes): {mutated[:100]}...")
+
         try:
             # Run the binary with mutated input
             p = start(binary_name)
             p.send(mutated)
+            p.shutdown('send')
             
             # Wait briefly for crash
             try:
@@ -331,7 +342,8 @@ def fuzz_binary(binary_name, max_time=60):
                         result = p.poll(block=False)  # type: ignore
                     
                     # Check if it crashed (non-zero exit)
-                    if result is not None and result != 0:
+                    # Exit code -6 is SIGABRT (abort()), which doesn't count as a crash
+                    if result is not None and result != 0 and result != -6:
                         crashes.append({
                             'input': mutated,
                             'exit_code': result,
