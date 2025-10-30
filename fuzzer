@@ -1,19 +1,14 @@
-#/bin/bash
+#!/bin/bash
 
-echo "My Awesome Fuzzer"
+# Simple bash wrapper that delegates the real work to the Python runner.
+echo "Launching Python fuzzer runner..."
 
-cat /example_inputs/challenge1.txt | /binaries/challenge1 &2>/dev/null
-if [ $? -ne 0 ]; then
-    echo "Error: Example input crashed binary??"
-    exit 1
+if command -v python3 >/dev/null 2>&1; then
+    python3 /run_main.py "$@"
+    rc=$?
+else
+    echo "Error: python3 is not installed in the container."
+    rc=127
 fi
 
-echo "AAAAAAAAAAAAAAAAAAAAA" | /binaries/challenge1
-if [ $? -eq 0 ]; then
-    echo "Error: Couldn't crash binary??"
-    exit 1
-fi
-
-echo "I found a hack!. Writing to /fuzzer_output/challenge1.txt"
-echo "AAAAAAAAAAAAAAAAAAAAA" > /fuzzer_output/challenge1.txt
-exit 0
+exit $rc
