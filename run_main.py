@@ -254,7 +254,7 @@ class JsonFuzzer(BaseFuzzer):
                 mutated_obj = self.mutate_json_structure(self.parsed_data)
                 try:
                     yield json.dumps(mutated_obj).encode('utf-8')
-                except:
+                except (TypeError, ValueError, RecursionError):
                     # If json.dumps fails, yield random bytes
                     yield self.mutate_bytes(self.example_input)
             else:
