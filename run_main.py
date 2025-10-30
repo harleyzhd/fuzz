@@ -10,6 +10,9 @@ from pwn import process, remote, gdb, args, context, u64, asm
 context.log_level = 'error'  # Reduce pwn noise
 context.update(arch='amd64', os='linux')
 
+# Debug flag - set to True to print every iteration's payload
+DEBUG_PRINT_PAYLOADS = False
+
 BINARIES_PATH = (Path(__file__).parent / "binaries").resolve()
 INPUTS_PATH = (Path(__file__).parent / "example_inputs").resolve()
 OUTPUT_PATH = (Path(__file__).parent / "fuzzer_output").resolve()
@@ -123,19 +126,55 @@ class PlaintextFuzzer(BaseFuzzer):
 class JsonFuzzer(BaseFuzzer):
     """Fuzzer for JSON inputs."""
     
+    def __init__(self, example_input):
+        """Initialize the JSON fuzzer."""
+        super().__init__(example_input)
+        self._json = self.parsed_data
+    
     def parse_input(self, data):
         """Parse JSON data."""
         return json.loads(data.decode('utf-8'))
     
+    def generate_format_strings(self, json_dict):
+        """Generate format string variations in JSON values."""
+        for key, value in json_dict.items():
+            if isinstance(value, str):
+                json_dict[key] = '%s' * 10
+            elif isinstance(value, list):
+                json_dict[key] = []
+            elif isinstance(value, dict):
+                json_dict[key] = self.generate_format_strings(value)
+        return json_dict
+    
+    def byteflip(self, json_data):
+        """Apply byte flips to JSON string representation."""
+        b = bytearray(json_data, 'UTF-8')
+        
+        for i in range(0, len(b)):
+            # Change 1 in 20 bytes
+            if random.randint(0, 20) == 1:
+                b[i] ^= random.getrandbits(7)
+        
+        return b.decode('ascii')
+    
     def generate(self):
         """Generate mutated JSON inputs."""
+        import copy
+        
+        # First, try sending empty file
+        yield b""
+        
+        # Now send invalid json
+        yield b"A" * 1000
+        
+        # Now send format strings
+        yield json.dumps(
+            self.generate_format_strings(copy.deepcopy(self._json))
+        ).encode('utf-8')
+        
+        # Maybe try some random bit flips?
         while True:
-            # TODO: Implement JSON-specific mutations
-            # - Add/remove keys
-            # - Modify values (strings, numbers, bools)
-            # - Nested structure mutations
-            # - Invalid JSON syntax injection
-            yield self.mutate_bytes(self.example_input)
+            yield self.byteflip(json.dumps(self._json)).encode('utf-8', errors='ignore')
 
 
 class XmlFuzzer(BaseFuzzer):
@@ -316,10 +355,18 @@ def fuzz_binary(binary_name, max_time=60):
         
         iterations += 1
         
+        if DEBUG_PRINT_PAYLOADS:
+            print(f"[DEBUG] Iteration {iterations}: Sending {len(mutated)} bytes")
+            if len(mutated) <= 100:
+                print(f"[DEBUG] Payload: {mutated}")
+            else:
+                print(f"[DEBUG] Payload (first 100 bytes): {mutated[:100]}...")
+        
         try:
             # Run the binary with mutated input
             p = start(binary_name)
             p.send(mutated)
+            p.shutdown('send')
             
             # Wait briefly for crash
             try:
