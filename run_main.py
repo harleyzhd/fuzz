@@ -378,7 +378,8 @@ def fuzz_binary(binary_name, max_time=60):
                         result = p.poll(block=False)  # type: ignore
                     
                     # Check if it crashed (non-zero exit)
-                    if result is not None and result != 0:
+                    # Exit code -6 is SIGABRT (abort()), which doesn't count as a crash
+                    if result is not None and result != 0 and result != -6:
                         crashes.append({
                             'input': mutated,
                             'exit_code': result,
