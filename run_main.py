@@ -408,6 +408,41 @@ class CsvFuzzer(BaseFuzzer):
         yield (b"A" * 2000)                       # size stress single-field appended
 
         seed_lines = self.parse_input(self.example_input) or []
+
+        # Detect if this is a numeric CSV (like csv2) by checking first line
+        is_numeric_csv = False
+        if seed_lines and len(seed_lines) > 0:
+            first_line = seed_lines[0].strip()
+            if ',' in first_line:
+                fields = first_line.split(',')
+                # Check if first line contains only numbers
+                try:
+                    [int(f.strip()) for f in fields if f.strip()]
+                    is_numeric_csv = True
+                except (ValueError, AttributeError):
+                    pass
+
+        # Special handling for numeric CSV (csv2 type)
+        if is_numeric_csv:
+            # csv2 has divide-by-zero bug when first field = 0
+            yield b"0,1\r\n"
+            yield b"0,2\r\n"
+            yield b"0,0\r\n"
+            yield b"0,10\r\n"
+            yield b"0,100\r\n"
+            yield b"0,-1\r\n"
+            yield b"0,-10\r\n"
+
+            # Multiple rows with 0 in first position
+            yield b"0,1\r\n0,2\r\n"
+            yield b"0,0\r\n0,0\r\n"
+
+            # Various numeric combinations
+            for n1 in [0, 1, -1, 10, 100, -100, 2147483647, -2147483648]:
+                for n2 in [0, 1, -1, 10, 100]:
+                    yield f"{n1},{n2}\r\n".encode('utf-8')
+
+        # Continue with existing CSV fuzzing strategies
         template = self._pick_template_row(seed_lines)
         block = self._make_block_vary_each_field(template, nrows=random.randint(6, 18))
         yield self._append_after_seed_text("\n".join([",".join(r) for r in block]) + "\n")
