@@ -227,7 +227,7 @@ class JsonFuzzer(BaseFuzzer):
         # Send deeply nested structure (billion laughs style)
         nested = {"a": {}}
         current = nested["a"]
-        for _ in range(1000):
+        for _ in range(990):
             current["a"] = {}
             current = current["a"]
         yield json.dumps(nested).encode('utf-8')
