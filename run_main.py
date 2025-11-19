@@ -104,7 +104,6 @@ def detect_input_type(data):
 
 
 def get_fuzzer_class(input_type):
-    """Return the appropriate fuzzer class for the given input type."""
     fuzzer_map = {
         'PLAINTEXT': PlaintextFuzzer,
         'JSON': JsonFuzzer,
@@ -117,8 +116,7 @@ def get_fuzzer_class(input_type):
     return fuzzer_map.get(input_type, BaseFuzzer)
 
 
-def fuzz_binary(binary_name, max_time=60):
-    """Fuzz a single binary and return results."""
+def fuzz_binary(binary_name, max_time=50):
     print(f"\n[*] Fuzzing binary: {binary_name}")
     
     # Load the valid input
