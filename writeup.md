@@ -13,4 +13,6 @@ Currently we have implemented fuzzing for two file types, .json and .csv. The JS
 
 The JSON class also runs a mutation on some of the parsed data which will randomly either remove a key, add a new key, modify a value, create a deeply nested structure or attempt to duplicate a key (invalid JSON)
 
-The csv generator...
+The CSV generator uses a similar framework to the JSON fuzzer but focuses on mutating rows and fields in ways that can break CSV parsers. It generates different types of common inputs, such as empty or oversized inputs, and mutates data by changing individual fields (adding quotes, replacing commas, inserting newlines), as well as performing row-level mutations that can reverse, delete, clear, or duplicate entire rows. During fuzzing, the harness sends the generated inputs to the target binary, which monitors for crashes or unexpected exits. 
+
+It is also effective at finding bugs such as buffer overflows, parsing errors, or crashes caused by inconsistent row lengths and invalid delimiters. Future improvements could include adding grammar-aware mutation (respecting proper CSV escaping), feedback-based mutation guidance, and better crash deduplication.
