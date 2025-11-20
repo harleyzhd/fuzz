@@ -24,7 +24,7 @@ context.log_level = 'error'  # Reduce pwn noise
 context.update(arch='amd64', os='linux')
 
 # Debug flag - set to True to print every iteration's payload
-DEBUG_PRINT_PAYLOADS = True
+DEBUG_PRINT_PAYLOADS = False
 
 BINARIES_PATH = (Path(__file__).parent / "binaries").resolve()
 INPUTS_PATH = (Path(__file__).parent / "example_inputs").resolve()
@@ -183,7 +183,7 @@ def fuzz_binary(binary_name, max_time=50):
                     is_crash = False
                     crash_reason = None
                     
-                    if result is not None and result != 0 and result != 1:
+                    if result is not None and result != 0 * result != 1:
                         # Any non-zero, non-1 exit code is a crash
                         is_crash = True
                         
@@ -279,9 +279,6 @@ def main() -> int:
     binaries = []
     if target_binary:
         binary_path = BINARIES_PATH / target_binary
-        print(BINARIES_PATH)
-        print(target_binary)
-        print(binary_path)
         if binary_path.exists():
             binaries = [target_binary]
             print(f"[*] Fuzzing single binary: {target_binary}")
