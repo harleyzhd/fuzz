@@ -316,7 +316,7 @@ def fuzz_binary(binary_name, max_time=50):
                 if hasattr(p, 'poll'):
                     result = p.poll(block=False)  # type: ignore
                     if result is None:
-                        time.sleep(1.5)
+                        time.sleep(0.1)
                         result = p.poll(block=False)  # type: ignore
 
                     # treat as crash if non-zero exit (except 1)
@@ -324,10 +324,10 @@ def fuzz_binary(binary_name, max_time=50):
                         desc = describe_exit(result)
                         preview = b""
                         try:
-                            preview = p.recvall(timeout=0.2)
+                            preview = p.recvall(timeout=0.1)
                         except Exception:
                             try:
-                                preview = p.recv(timeout=0.05)
+                                preview = p.recv(timeout=0.1)
                             except Exception:
                                 preview = b""
                         crashes.append({
