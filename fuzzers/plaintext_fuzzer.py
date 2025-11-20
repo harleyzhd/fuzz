@@ -3,19 +3,16 @@ from .base_fuzzer import BaseFuzzer
 
 
 class PlaintextFuzzer(BaseFuzzer):
-    
     def _mutate_line_boundaries(self, data):
         if not data:
             return data
         
         data = bytearray(data)
         mutation_type = random.randint(0, 2)
-        
-        # remove all newlines
+
         if mutation_type == 0:
             return bytes(data).replace(b'\n', b'').replace(b'\r', b'')
         
-        # null bytes at line boundaries
         elif mutation_type == 1:
             result = bytes(data).replace(b'\n', b'\n\x00')
             return result
@@ -73,7 +70,6 @@ class PlaintextFuzzer(BaseFuzzer):
         if mutation_type == 0:
             text = text.replace(' ', '').replace('\t', '').replace('\n', '')
 
-        # very long words (buffer overflow)
         elif mutation_type == 1:
             words = text.split()
             if words:
@@ -81,7 +77,6 @@ class PlaintextFuzzer(BaseFuzzer):
                 words.insert(random.randint(0, len(words)), long_word)
                 text = ' '.join(words)
 
-        # null separators
         else:
             words = text.split()
             text = '\x00'.join(words)
@@ -106,14 +101,12 @@ class PlaintextFuzzer(BaseFuzzer):
         ]
         
         mutation_type = random.randint(0, 2)
-        
-        # insert at random position
+
         if mutation_type == 0:
             seq = random.choice(special_sequences)
             pos = random.randint(0, len(data))
             data[pos:pos] = seq
 
-        # append
         elif mutation_type == 1:
             seq = random.choice(special_sequences)
             data = data + bytearray(seq)
@@ -163,7 +156,6 @@ class PlaintextFuzzer(BaseFuzzer):
     def _create_pathological_inputs(self):
         pattern_type = random.randint(0, 7)
         
-        # extremely long line (buffer overflow)
         if pattern_type == 0:
             return b'A' * random.choice([1000, 5000, 10000, 50000])
         
@@ -172,15 +164,12 @@ class PlaintextFuzzer(BaseFuzzer):
             pattern = random.choice([b'AB', b'XYZ', b'0123', b'\x00\xff'])
             return pattern * random.choice([500, 1000, 5000])
         
-        # all null bytes
         elif pattern_type == 2:
             return b'\x00' * random.choice([100, 500, 1000])
         
-        # all 0xFF bytes
         elif pattern_type == 3:
             return b'\xff' * random.choice([100, 500, 1000])
         
-        # format strings
         elif pattern_type == 4:
             return b'%s%n%x%p%d' * random.choice([10, 50, 100])
         
@@ -203,8 +192,7 @@ class PlaintextFuzzer(BaseFuzzer):
             for _ in range(random.randint(1, 5)):
                 text += bytes([random.randint(0, 31)])
             return text + b'\n'
-        
-        # random bytes
+
         else:
             size = random.choice([100, 500, 1000])
             return random.randbytes(size)
@@ -223,13 +211,12 @@ class PlaintextFuzzer(BaseFuzzer):
                     len(data) // 2, len(data) - 1
                 ])
                 return data[:min(new_len, len(data))]
-        
-        # repetition (buffer overflow)
+
         elif mutation_type == 1:
             repeat_count = random.choice([8, 16, 32, 64, 128])
             return data * repeat_count
         
-        # massive padding (buffer overflow)
+        # massive padding
         else:
             padding_size = random.choice([10000, 100000])
             padding_byte = random.choice([0, 0x41, 0xff])
@@ -246,7 +233,7 @@ class PlaintextFuzzer(BaseFuzzer):
         
         mutation_type = random.randint(0, 3)
         
-        # boundary values (integer overflow/underflow)
+        # boundary values
         if mutation_type == 0:
             import re
             boundary_values = [
@@ -271,7 +258,7 @@ class PlaintextFuzzer(BaseFuzzer):
             result = re.sub(r'\d+', '%d%n%s%x', text)
             return result.encode('utf-8', errors='ignore')
         
-        # very large numbers (integer overflow)
+        # very large numbers
         else:
             lines = text.split('\n')
             lines.insert(random.randint(0, len(lines)), str(2**63))
@@ -317,7 +304,7 @@ class PlaintextFuzzer(BaseFuzzer):
                     ])
             return '\n'.join(lines).encode('utf-8', errors='ignore')
         
-        # mutate only second field (common for password+input)
+        # mutate only second field
         elif mutation_type == 2:
             if len(lines) > 1:
                 import re
@@ -489,6 +476,18 @@ class PlaintextFuzzer(BaseFuzzer):
             
             yield mutated
 
-        # fallback to random byte mutations
         while True:
-            yield self.mutate_bytes(self.example_input)
+            mutated = self.example_input
+            num_mutations = random.randint(3, 5)
+            
+            for _ in range(num_mutations):
+                mutation_func = random.choice([
+                    self._mutate_structured_fields,
+                    self._mutate_numbers,
+                    self._mutate_encoding,
+                    self._insert_special_sequences,
+                    self._mutate_length,
+                ])
+                mutated = mutation_func(mutated)
+            
+            yield mutated
