@@ -338,7 +338,7 @@ class CsvFuzzer(BaseFuzzer):
         # same but with semicolon delimiters
         block_sc = self._make_block_vary_each_field(template, nrows=random.randint(3, 8))
         yield self._append_after_seed_text("\n".join([(";".join(r)) for r in block_sc]) + "\n")
-        print("1")
+        
         # append line(s) with growing last field size
         if seed_lines:
             template_line = seed_lines[-1] if seed_lines[-1].strip() else (
@@ -349,27 +349,27 @@ class CsvFuzzer(BaseFuzzer):
         # repeat the last line many times as separate rows
         for p in self._repeat_last_line_block(seed_lines, counts=[10, 50, 100]):
             yield p
-        print("1")
+        
         # Format string payloads
         for p in self._format_string_payloads(seed_lines):
             yield p
-        print("1")
+        
         # Null and control payloads
         for p in self._null_and_control_payloads(seed_lines):
             yield p
-        print("1")
+        
         # Max/min numeric payloads
         for p in self._extreme_numeric_payloads(seed_lines):
             yield p
-        print("1")
+        
         # Empty field payloads
         for p in self._empty_field_payloads(seed_lines):
             yield p
-        print("1")
+        
         # Whitespace payloads
         for p in self._whitespace_payloads(seed_lines):
             yield p
-        print("1")
+        
         # semi-colon version of last line as 20 rows
         if seed_lines:
             last = seed_lines[-1] if seed_lines[-1].strip() else (
@@ -398,7 +398,7 @@ class CsvFuzzer(BaseFuzzer):
                 if random.randint(0, rate) == 1:
                     b[i] ^= random.getrandbits(7)
             yield bytes(b)
-        print("1")
+        
         # Keep mutating indefinitely
         while True:
             yield self.mutate_bytes(self.example_input)
