@@ -4,7 +4,6 @@ import os
 import time
 import json
 from pathlib import Path
-import signal
 from pwn import process, remote, gdb, args, context, u64, asm
 
 from fuzzers import (
@@ -23,8 +22,6 @@ context.update(arch='amd64', os='linux')
 
 # Debug flag - set to True to print every iteration's payload
 DEBUG_PRINT_PAYLOADS = False
-# also allow environment-controlled debug
-FUZZ_DEBUG = bool(os.environ.get("FUZZ_DEBUG", "") and os.environ.get("FUZZ_DEBUG") not in ("0", "false", "False"))
 
 BINARIES_PATH = (Path(__file__).parent / "binaries").resolve()
 INPUTS_PATH = (Path(__file__).parent / "example_inputs").resolve()
@@ -119,33 +116,6 @@ def get_fuzzer_class(input_type):
     return fuzzer_map.get(input_type, BaseFuzzer)
 
 
-def describe_exit(result):
-    """Return a human-readable description for a process return code."""
-    if result is None:
-        return "TIMEOUT"
-    try:
-        rc = int(result)
-    except Exception:
-        return str(result)
-    # Negative return code: Python encodes signal terminations as -SIGNUM
-    if rc < 0:
-        sig = -rc
-        try:
-            name = signal.Signals(sig).name
-        except Exception:
-            name = f"SIG{sig}"
-        return f"terminated by signal {sig} ({name})"
-    # High exit codes (>=129) sometimes indicate 128+SIGNUM
-    if rc > 128:
-        sig = rc - 128
-        try:
-            name = signal.Signals(sig).name
-        except Exception:
-            name = f"SIG{sig}"
-        return f"exit {rc} (likely signal {sig} ({name}))"
-    return f"exit {rc}"
-
-
 def fuzz_binary(binary_name, max_time=50):
     print(f"\n[*] Fuzzing binary: {binary_name}")
     
@@ -180,13 +150,6 @@ def fuzz_binary(binary_name, max_time=50):
     
     # Use the fuzzer's generator to get mutated inputs
     for mutated in fuzzer.generate():
-        # iteration-level debug
-        if DEBUG_PRINT_PAYLOADS or FUZZ_DEBUG:
-            try:
-                plen = len(mutated) if isinstance(mutated, (bytes, bytearray)) else 0
-            except Exception:
-                plen = 0
-            print(f"[FUZZ DEBUG] binary={binary_name} iter={iterations+1} payload_len={plen} input_type={input_type}", flush=True)
         if (time.time() - start_time) >= max_time:
             break
         
@@ -205,46 +168,51 @@ def fuzz_binary(binary_name, max_time=50):
             p.send(mutated)
             p.shutdown('send')
             
+            # Wait briefly for crash
             try:
                 if hasattr(p, 'poll'):
-                    CSV_LONG_WAIT = 1.5    # seconds
-                    wait_seconds = 0.1
-
-                    if input_type == 'CSV':
-                        wait_seconds = CSV_LONG_WAIT
-
-                    time.sleep(wait_seconds)
                     result = p.poll(block=False)  # type: ignore
-                       
-                    out = b""
-                    try:
-                        out = p.recvall(timeout=0.2)
-                    except Exception:
-                        try:
-                            out = p.recv(timeout=0.1)
-                        except Exception:
-                            out = b""
+                    if result is None:
+                        # Still running, wait a bit
+                        time.sleep(0.1)
+                        result = p.poll(block=False)  # type: ignore check failure
 
-                    if result is not None and result != 0:
-                        desc = describe_exit(result)
-                        preview = ""
-                        try:
-                            preview = out.decode('utf-8', errors='ignore').replace("\n","\\n")
-                        except Exception:
-                            preview = "<binary output>"
-                        crashes.append({
+                    is_crash = False
+                    crash_reason = None
+                    
+                    if result is not None and result != 0 and result != 1:
+                        # Any non-zero, non-1 exit code is a crash
+                        is_crash = True
+                        
+                        # Try to get more specific crash reason
+                        if result == -6:
+                            crash_reason = "SIGABRT (signal 6)"
+                            try:
+                                output = p.recvall(timeout=0.1).decode('utf-8', errors='ignore')
+                                if 'stack smashing detected' in output.lower() or 'stack check' in output.lower():
+                                    crash_reason = "Stack smashing detected (SIGABRT)"
+                            except:
+                                pass
+                        elif result < 0:
+                            crash_reason = f"Signal {result}"
+                        else:
+                            crash_reason = f"Exit code {result}"
+                    
+                    if is_crash:
+                        crash_info = {
                             'input': mutated,
                             'exit_code': result,
-                            'iteration': iterations,
-                            'desc': desc,
-                            'output': out
-                        })
-                        print(f"[+] Crash found! {desc}, Exit code: {result}, Iteration: {iterations}, preview: {preview[:160]}")
+                            'iteration': iterations
+                        }
+                        if crash_reason:
+                            crash_info['reason'] = crash_reason
+                        crashes.append(crash_info)
+                        print(f"[+] Crash found! {crash_reason}, Iteration: {iterations}")
                         try:
                             p.close()
                         except Exception:
                             pass
-                        # stop fuzzing this binary immediately
+                        # stop fuzzing this binary, move to next
                         return crashes
             except Exception:
                 pass
@@ -260,16 +228,12 @@ def fuzz_binary(binary_name, max_time=50):
                     'iteration': iterations
                 })
                 print(f"[+] Crash found! Error: {str(e)[:50]}, Iteration: {iterations}")
-                # stop fuzzing this binary immediately
+                # stop fuzzing this binary, move to next
                 return crashes
         
         if iterations % 100 == 0:
             print(f"[*] Iterations: {iterations}, Time: {int(time.time() - start_time)}s")
     
-    # generator finished (either exhausted or loop ended). Log if it finished early.
-    elapsed = time.time() - start_time
-    if elapsed < max_time and iterations < 5 and (not crashes):
-        print(f"[FUZZ INFO] generator for {binary_name} finished after {iterations} iterations (elapsed {elapsed:.2f}s); max_time={max_time}s", flush=True)
     print(f"[*] Finished fuzzing {binary_name}: {iterations} iterations, {len(crashes)} crashes")
     return crashes
 
@@ -289,21 +253,10 @@ def save_results(binary_name, crashes):
             f.write(f"  Iteration: {crash['iteration']}\n")
             if 'exit_code' in crash:
                 f.write(f"  Exit code: {crash['exit_code']}\n")
-            if 'desc' in crash:
-                f.write(f"  Description: {crash['desc']}\n")
-            if 'timeout' in crash and crash.get('timeout'):
-                f.write(f"  Timeout/Hang: True\n")
             if 'error' in crash:
                 f.write(f"  Error: {crash['error']}\n")
             f.write(f"  Input (hex): {crash['input'].hex()}\n")
             f.write(f"  Input (repr): {repr(crash['input'][:100])}\n")
-            if 'output' in crash and isinstance(crash['output'], (bytes, bytearray)):
-                try:
-                    out_preview = crash['output'].decode('utf-8', errors='ignore').replace("\n","\\n")
-                except Exception:
-                    out_preview = "<binary output>"
-                f.write(f"  Output (repr): {repr(out_preview[:200])}\n")
-                f.write(f"  Output (hex): {crash['output'].hex()[:400]}\n")
             f.write("\n")
     
     print(f"[*] Results saved to {output_file}")
