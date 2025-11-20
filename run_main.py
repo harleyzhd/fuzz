@@ -180,6 +180,7 @@ class JsonFuzzer(BaseFuzzer):
             yield self.byteflip(json.dumps(self._json)).encode('utf-8', errors='ignore')
 
 class XmlFuzzer(BaseFuzzer):
+    #I cannot get any of these binaries to crash, i've spent like 15 hours on this and nothing is working
     def __init__(self, example_input):
         super().__init__(example_input)
 
@@ -195,10 +196,7 @@ class XmlFuzzer(BaseFuzzer):
         except Exception:
             self._xml = None
 
-    # -------------------------
     # Basic byte-level mutators
-    # -------------------------
-
     def byteflip(self, xml_bytes, flip_prob=0.05):
         b = bytearray(xml_bytes)
         for i in range(len(b)):
@@ -213,10 +211,7 @@ class XmlFuzzer(BaseFuzzer):
             b.insert(pos, random.choice([0xC0, 0xC1, 0xF5, 0xFF]))
         return bytes(b)
 
-    # -------------------------
     # XML structural mutations
-    # -------------------------
-
     def mutate_tag_names(self, xml_bytes, max_len=50):
         s = xml_bytes.decode("latin-1")
 
@@ -264,10 +259,7 @@ class XmlFuzzer(BaseFuzzer):
 
         return s.encode("latin-1")
 
-    # -------------------------
     # Deep structural expansions
-    # -------------------------
-
     def generate_deep_nesting(self, depth=1000):
         depth = min(depth, 20000)
         xml = []
@@ -301,10 +293,7 @@ class XmlFuzzer(BaseFuzzer):
             "<" + ("T" * length) + ">X</" + ("T" * length) + ">"
         ).encode("utf-8")
 
-    # -------------------------
     # CDATA, comments, headers
-    # -------------------------
-
     def inject_cdata(self, xml_bytes):
         s = xml_bytes.decode("latin-1")
         cdata = "<![CDATA[" + ("A" * random.randint(50, 200)) + "]]>"
@@ -326,10 +315,7 @@ class XmlFuzzer(BaseFuzzer):
         ]
         return random.choice(headers).encode() + xml_bytes
 
-    # -------------------------
     # Mismatches, illegal entities
-    # -------------------------
-
     def generate_mismatched_tags(self, xml_bytes):
         s = xml_bytes.decode("latin-1")
         s = re.sub(r"</(\w+)>", r"<\1>", s)
@@ -343,10 +329,6 @@ class XmlFuzzer(BaseFuzzer):
             s = s.replace(ent, f"{ent}{random.choice(endings)}")
         return s.encode("latin-1")
 
-    # -------------------------
-    # MAIN GENERATOR LOOP
-    # -------------------------
-
     def generate(self):
         # Base seed
         if self._xml is not None:
@@ -354,51 +336,51 @@ class XmlFuzzer(BaseFuzzer):
         else:
             seed = self._seed_bytes or b"<root>seed</root>"
 
-        # Basic seeds
-        yield b"" + b"\x00" * 2
-        yield b"<" * 10000 + b"\x00" * 2
+        # Basic inputs
+        yield b"" + b"\x00" 
+        yield b"<" * 10000 + b"\x00" 
 
         while True:
             r = random.random()
 
             if r < 0.10:
-                yield self.byteflip(seed) + b"\x00" * 2
+                yield self.byteflip(seed) + b"\x00" 
 
             elif r < 0.20:
-                yield self.inject_invalid_utf8(seed) + b"\x00" * 2
+                yield self.inject_invalid_utf8(seed) + b"\x00" 
 
             elif r < 0.30:
-                yield self.mutate_tag_names(seed) + b"\x00" * 2
+                yield self.mutate_tag_names(seed) + b"\x00" 
 
             elif r < 0.40:
-                yield self.mutate_attributes(seed) + b"\x00" * 2
+                yield self.mutate_attributes(seed) + b"\x00" 
 
             elif r < 0.45:
-                yield self.generate_deep_nesting(random.randint(50, 5000)) + b"\x00" * 2
+                yield self.generate_deep_nesting(random.randint(50, 5000)) + b"\x00" 
 
             elif r < 0.50:
-                yield self.generate_entity_bomb() + b"\x00" * 2
+                yield self.generate_entity_bomb() + b"\x00" 
 
             elif r < 0.55:
-                yield self.generate_external_entity() + b"\x00" * 2
+                yield self.generate_external_entity() + b"\x00" 
 
             elif r < 0.60:
-                yield self.inject_cdata(seed) + b"\x00" * 2
+                yield self.inject_cdata(seed) + b"\x00" 
 
             elif r < 0.65:
-                yield self.inject_comments(seed) + b"\x00" * 2
+                yield self.inject_comments(seed) + b"\x00" 
 
             elif r < 0.70:
-                yield self.mangled_xml_header(seed) + b"\x00" * 2
+                yield self.mangled_xml_header(seed) + b"\x00" 
 
             elif r < 0.75:
-                yield self.generate_mismatched_tags(seed) + b"\x00" * 2
+                yield self.generate_mismatched_tags(seed) + b"\x00" 
 
             elif r < 0.80:
-                yield self.inject_illegal_entities(seed) + b"\x00" * 2
+                yield self.inject_illegal_entities(seed) + b"\x00" 
 
             elif r < 0.85:
-                yield self.random_long_tag(random.choice([512, 2048, 65536])) + b"\x00" * 2
+                yield self.random_long_tag(random.choice([512, 2048, 65536])) + b"\x00" 
 
             else:
                 # Mutation chain for more chaos
@@ -413,7 +395,7 @@ class XmlFuzzer(BaseFuzzer):
                 ]
                 for _ in range(random.randint(2, 5)):
                     b = random.choice(funcs)(b)
-                yield b + b"\x00" * 2
+                yield b + b"\x00" 
 
 class CsvFuzzer(BaseFuzzer):
 
