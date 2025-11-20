@@ -1,0 +1,32 @@
+%PDF-1.2
+1 0 obj
+<< /Title (Sample PDF Title) /Creator (Test) >>
+endobj
+2 0 obj
+<< /Type /Catalog /Pages 3 0 R >>
+endobj
+3 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 3 0 R /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 12 >>
+stream
+BT ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f
+0000000010 00000 n
+0000000070 00000 n
+0000000120 00000 n
+0000000180 00000 n
+0000000240 00000 n
+trailer
+<< /Size 6 /Root 2 0 R /Info 1 0 R >>
+startxref
+300
+%%EOF
