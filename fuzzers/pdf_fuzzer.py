@@ -86,6 +86,9 @@ class PdfFuzzer(BaseFuzzer):
                 str(random.randint(1, 32)),
                 str(random.randint(1000, 200000)),
                 str(2 ** 31 - 1),
+                "-1",
+                str(random.randint(-1000, -1)),
+                "999999999",
             ])
             text = text.replace(f"/Length {value}", f"/Length {fuzzed}", 1)
         return self._encode(text)
@@ -100,6 +103,16 @@ class PdfFuzzer(BaseFuzzer):
             data[idx] ^= random.randint(1, 255)
         mutated = self.text.replace("stream" + choice + "endstream",
                                     "stream" + data.decode("latin-1", errors="ignore") + "endstream", 1)
+        return self._encode(mutated)
+
+    def _swap_stream_markers(self):
+        if "stream" not in self.text or "endstream" not in self.text:
+            return self.example_input
+        parts = self.text.split("endstream", 1)
+        if len(parts) < 2:
+            return self.example_input
+        # Move endstream earlier to create negative actual length
+        mutated = "endstream\n" + parts[0] + parts[1]
         return self._encode(mutated)
 
     def _mutate_xref(self):
@@ -198,6 +211,7 @@ startxref
             self._filter_mutation,
             self._rotate_objects,
             self._header_mutation,
+            self._swap_stream_markers,
             lambda: self.mutate_bytes(self.example_input),
         ]
 

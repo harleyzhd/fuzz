@@ -166,6 +166,7 @@ GEN_QUEUE_MAX = int(os.environ.get("GEN_QUEUE_MAX", "4"))
 MAX_MUTATED_SIZE = int(os.environ.get("MAX_MUTATED_SIZE", str(200_000)))
 # optional small sleep between iterations to reduce process churn (seconds)
 ITER_SLEEP = float(os.environ.get("ITER_SLEEP", "0.0"))
+# maximum crashes to record per binary before stopping fuzzing that target
 # maximum time to wait for target before treating as hang
 PROCESS_TIMEOUT = float(os.environ.get("PROC_WAIT_TIMEOUT", "0.5"))
 POLL_INTERVAL = float(os.environ.get("PROC_POLL_INTERVAL", "0.01"))
@@ -238,6 +239,7 @@ def fuzz_binary(binary_name, max_time=50):
         return []
     
     crashes = []
+    seen_signatures = set()
     iterations = 0
     start_time = time.time()
     
@@ -301,12 +303,17 @@ def fuzz_binary(binary_name, max_time=50):
             try:
                 p.send(mutated)
             except Exception as err:
-                crashes.append({
-                    'input': mutated,
-                    'error': f"send failure: {err}",
-                    'iteration': iterations,
-                })
-                print(f"[+] Crash found (send failure): {err}, Iteration: {iterations}")
+                sig = ("send", str(err))
+                if sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    crashes.append({
+                        'input': mutated,
+                        'error': f"send failure: {err}",
+                        'iteration': iterations,
+                    })
+                    print(f"[+] Crash found (send failure): {err}, Iteration: {iterations}")
+                else:
+                    print(f"[!] Duplicate crash signature ignored (send failure): {err}")
                 try:
                     p.close()
                 except Exception:
@@ -350,12 +357,20 @@ def fuzz_binary(binary_name, max_time=50):
 
                     out = b""
                     try:
-                        out = p.recvall(timeout=0.2)
+                        err_data = p.proc.stderr.read() if hasattr(p.proc, "stderr") else b""
+                        if err_data:
+                            out += err_data if isinstance(err_data, bytes) else err_data.encode('utf-8', errors='ignore')
+                    except Exception:
+                        pass
+                    try:
+                        data = p.recvall(timeout=0.2)
+                        out += data
                     except Exception:
                         try:
-                            out = p.recv(timeout=0.1)
+                            data = p.recv(timeout=0.1)
+                            out += data
                         except Exception:
-                            out = b""
+                            pass
 
                     if poll_result not in (None, 0):
                         desc = describe_exit(poll_result)
@@ -364,19 +379,46 @@ def fuzz_binary(binary_name, max_time=50):
                             preview = out.decode('utf-8', errors='ignore').replace("\n","\\n")
                         except Exception:
                             preview = "<binary output>"
-                        crashes.append({
+
+                        abort_pattern = (
+                            "stack smashing detected",
+                            "__stack_chk_fail",
+                            "stack-buffer-overflow",
+                            "Stack smashing detected",
+                        )
+                        is_stack_smash = False
+                        if poll_result in (-6, 134):
+                            lower = preview.lower()
+                            is_stack_smash = any(pattern.lower() in lower for pattern in abort_pattern)
+
+                        crash_info = {
                             'input': mutated,
                             'exit_code': poll_result,
                             'iteration': iterations,
                             'desc': desc,
                             'output': out
-                        })
-                        print(f"[+] Crash found! {desc}, Exit code: {poll_result}, Iteration: {iterations}, preview: {preview[:160]}")
+                        }
+                        if poll_result in (-6, 134) and not is_stack_smash:
+                            crash_info['logical_abort'] = True
+
+                        sig = (
+                            "poll",
+                            poll_result,
+                            crash_info.get('desc'),
+                            crash_info.get('logical_abort'),
+                            preview[:160],
+                        )
+                        if sig not in seen_signatures:
+                            seen_signatures.add(sig)
+                            crashes.append(crash_info)
+                            tag = "[+]" if not crash_info.get("logical_abort") else "[!] (logical abort)"
+                            print(f"{tag} {desc}, Exit code: {poll_result}, Iteration: {iterations}, preview: {preview[:160]}")
+                        else:
+                            print(f"[!] Duplicate crash signature ignored for exit {poll_result} iteration {iterations}")
                         try:
                             p.close()
                         except Exception:
                             pass
-                        # stop fuzzing this binary immediately
                         return crashes
             except Exception:
                 pass
@@ -386,13 +428,17 @@ def fuzz_binary(binary_name, max_time=50):
         except Exception as e:
             # Binary might have crashed before we could interact
             if any(sig in str(e) for sig in ("SIGSEGV", "SIGABRT", "SIGILL", "send failure")):
-                crashes.append({
-                    'input': mutated,
-                    'error': str(e),
-                    'iteration': iterations
-                })
-                print(f"[+] Crash found! Error: {str(e)[:50]}, Iteration: {iterations}")
-                # stop fuzzing this binary immediately
+                sig = ("exception", str(e))
+                if sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    crashes.append({
+                        'input': mutated,
+                        'error': str(e),
+                        'iteration': iterations
+                    })
+                    print(f"[+] Crash found! Error: {str(e)[:50]}, Iteration: {iterations}")
+                else:
+                    print(f"[!] Duplicate exception crash ignored: {str(e)[:50]}")
                 return crashes
         
         if iterations % 100 == 0:
@@ -484,7 +530,7 @@ def main() -> int:
     # Hard cap for safety during testing
     HARD_WORKER_LIMIT = 2
     workers_before_cap = workers
-    workers = 4
+    workers = max(1, min(workers, HARD_WORKER_LIMIT, len(binaries)))
     print(f"[*] Binaries to fuzz: {binaries}", flush=True)
     print(f"[*] System logical CPUs (os.cpu_count()) = {cpu}", flush=True)
     print(f"[*] FUZZ_PARALLEL env='{workers_env}' -> requested={workers_before_cap}, using_workers={workers} (hard cap {HARD_WORKER_LIMIT})", flush=True)
