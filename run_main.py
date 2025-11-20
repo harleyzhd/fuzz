@@ -58,7 +58,14 @@ def start(binary_name, argv=[], *a, **kwargs):
         # probably dont need this lol
         return remote(sys.argv[1], sys.argv[2], *a, **kwargs)
     else:
-        return process([str(binary_path)] + argv, *a, **kwargs)
+        return process(
+            [str(binary_path)] + argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            *a,
+            **kwargs,
+        )
 
 
 def detect_input_type(data):
@@ -159,6 +166,9 @@ GEN_QUEUE_MAX = int(os.environ.get("GEN_QUEUE_MAX", "4"))
 MAX_MUTATED_SIZE = int(os.environ.get("MAX_MUTATED_SIZE", str(200_000)))
 # optional small sleep between iterations to reduce process churn (seconds)
 ITER_SLEEP = float(os.environ.get("ITER_SLEEP", "0.0"))
+# maximum time to wait for target before treating as hang
+PROCESS_TIMEOUT = float(os.environ.get("PROC_WAIT_TIMEOUT", "0.5"))
+POLL_INTERVAL = float(os.environ.get("PROC_POLL_INTERVAL", "0.01"))
 
 def _start_generator_thread(gen, q, name):
     """Start one daemon thread per binary that repeatedly pulls from the generator and pushes into q."""
@@ -288,20 +298,56 @@ def fuzz_binary(binary_name, max_time=50):
         try:
             # Run the binary with mutated input
             p = start(binary_name)
-            p.send(mutated)
+            try:
+                p.send(mutated)
+            except Exception as err:
+                crashes.append({
+                    'input': mutated,
+                    'error': f"send failure: {err}",
+                    'iteration': iterations,
+                })
+                print(f"[+] Crash found (send failure): {err}, Iteration: {iterations}")
+                try:
+                    p.close()
+                except Exception:
+                    pass
+                return crashes
+
             p.shutdown('send')
-            
+
             try:
                 if hasattr(p, 'poll'):
                     CSV_LONG_WAIT = 1.5    # seconds
-                    wait_seconds = 0.1
-
+                    wait_seconds = PROCESS_TIMEOUT
                     if input_type == 'CSV':
-                        wait_seconds = CSV_LONG_WAIT
+                        wait_seconds = max(wait_seconds, CSV_LONG_WAIT)
 
-                    time.sleep(wait_seconds)
-                    result = p.poll(block=False)  # type: ignore
-                       
+                    poll_result = None
+                    deadline = time.time() + wait_seconds
+                    while time.time() < deadline:
+                        try:
+                            poll_result = p.poll(block=False)  # type: ignore
+                        except Exception:
+                            poll_result = getattr(p, 'returncode', None)
+                            break
+                        if poll_result is not None:
+                            break
+                        time.sleep(POLL_INTERVAL)
+
+                    if poll_result is None:
+                        crashes.append({
+                            'input': mutated,
+                            'iteration': iterations,
+                            'timeout': True,
+                            'error': f"process hang >{wait_seconds:.2f}s"
+                        })
+                        print(f"[!] Potential hang: {binary_name} timed out after {wait_seconds:.2f}s at iteration {iterations}")
+                        try:
+                            p.close()
+                        except Exception:
+                            pass
+                        continue
+
                     out = b""
                     try:
                         out = p.recvall(timeout=0.2)
@@ -311,8 +357,8 @@ def fuzz_binary(binary_name, max_time=50):
                         except Exception:
                             out = b""
 
-                    if result is not None and result != 0:
-                        desc = describe_exit(result)
+                    if poll_result not in (None, 0):
+                        desc = describe_exit(poll_result)
                         preview = ""
                         try:
                             preview = out.decode('utf-8', errors='ignore').replace("\n","\\n")
@@ -320,12 +366,12 @@ def fuzz_binary(binary_name, max_time=50):
                             preview = "<binary output>"
                         crashes.append({
                             'input': mutated,
-                            'exit_code': result,
+                            'exit_code': poll_result,
                             'iteration': iterations,
                             'desc': desc,
                             'output': out
                         })
-                        print(f"[+] Crash found! {desc}, Exit code: {result}, Iteration: {iterations}, preview: {preview[:160]}")
+                        print(f"[+] Crash found! {desc}, Exit code: {poll_result}, Iteration: {iterations}, preview: {preview[:160]}")
                         try:
                             p.close()
                         except Exception:
@@ -334,12 +380,12 @@ def fuzz_binary(binary_name, max_time=50):
                         return crashes
             except Exception:
                 pass
-            
+
             p.close()
-            
+
         except Exception as e:
             # Binary might have crashed before we could interact
-            if "SIGSEGV" in str(e) or "SIGABRT" in str(e) or "SIGILL" in str(e):
+            if any(sig in str(e) for sig in ("SIGSEGV", "SIGABRT", "SIGILL", "send failure")):
                 crashes.append({
                     'input': mutated,
                     'error': str(e),

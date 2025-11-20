@@ -1,0 +1,4 @@
+<items count="4">
+  <item>alpha</item>
+  <item>beta</item>
+</items>
