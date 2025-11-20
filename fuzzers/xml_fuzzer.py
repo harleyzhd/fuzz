@@ -104,7 +104,7 @@ class XmlFuzzer(BaseFuzzer):
         if add_long_attrs:
             def add_attrs(m):
                 extras = " ".join(
-                    f'attr{i}="{ "A"*random.randint(200,2000) }"'
+                    f'attr{i}="{ "A"*random.randint(100,10000) }"'
                     for i in range(random.randint(0, 20))
                 )
                 return m.group(0) + " " + extras
@@ -155,7 +155,7 @@ class XmlFuzzer(BaseFuzzer):
     # CDATA, comments, headers
     def inject_cdata(self, xml_bytes):
         s = xml_bytes.decode("latin-1")
-        cdata = "<![CDATA[" + ("A" * random.randint(50, 200)) + "]]>"
+        cdata = "<![CDATA[" + ("A" * random.randint(25, 100)) + "]]>"
         pos = random.randint(0, len(s))
         return (s[:pos] + cdata + s[pos:]).encode("latin-1")
 
@@ -206,6 +206,10 @@ class XmlFuzzer(BaseFuzzer):
         yield b'<\xff>'
         yield b'<a><b></a></b>' 
         yield b'<!DOCTYPE x ['
+        yield b'<tag id = 9999999999999999999999999999999999999999>'
+        yield b'<tag id = -1>'
+        yield b"<foo attr=sup>"
+
 
         while True:
             r = random.random()
@@ -268,6 +272,6 @@ class XmlFuzzer(BaseFuzzer):
                     self.inject_cdata,
                     self.inject_comments,
                 ]
-                for _ in range(random.randint(2, 5)):
+                for i in range(random.randint(2, 5)):
                     b = random.choice(funcs)(b)
                 yield b
