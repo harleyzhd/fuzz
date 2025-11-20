@@ -177,16 +177,11 @@ def fuzz_binary(binary_name, max_time=50):
                     result = p.poll(block=False)  # type: ignore
                     if result is None:
                         # Still running, wait a bit
-<<<<<<< HEAD
-                        time.sleep(0.5)
-                        result = p.poll(block=False)  # type: ignore
-=======
                         time.sleep(0.1)
                         result = p.poll(block=False)  # type: ignore check failure
 
                     is_crash = False
                     crash_reason = None
->>>>>>> a5d860f182d1d8460b19aadd8bd6eaf3fb4fee58
                     
                     if result is not None and result != 0 and result != 1:
                         # Any non-zero, non-1 exit code is a crash
