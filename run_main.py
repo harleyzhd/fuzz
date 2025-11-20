@@ -3,6 +3,9 @@ import sys
 import os
 import time
 import json
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import signal
 from pwn import process, remote, gdb, args, context, u64, asm
@@ -146,6 +149,56 @@ def describe_exit(result):
     return f"exit {rc}"
 
 
+# seconds to wait for the fuzzer generator to produce the next payload before giving up
+GENERATOR_YIELD_TIMEOUT = float(os.environ.get("GENERATOR_YIELD_TIMEOUT", "5.0"))
+
+# Backpressure / safety settings
+# maximum queued mutated payloads per generator thread (defaults to small number)
+GEN_QUEUE_MAX = int(os.environ.get("GEN_QUEUE_MAX", "4"))
+# maximum mutated payload size (bytes) we'll send to the target (truncate if larger)
+MAX_MUTATED_SIZE = int(os.environ.get("MAX_MUTATED_SIZE", str(200_000)))
+# optional small sleep between iterations to reduce process churn (seconds)
+ITER_SLEEP = float(os.environ.get("ITER_SLEEP", "0.0"))
+
+def _start_generator_thread(gen, q, name):
+    """Start one daemon thread per binary that repeatedly pulls from the generator and pushes into q."""
+    def runner():
+        try:
+            while True:
+                item = next(gen)
+                # put will block if queue is full -> backpressure the generator
+                q.put(('value', item))
+        except StopIteration:
+            q.put(('stop', None))
+        except Exception as e:
+            q.put(('error', e))
+
+    t = threading.Thread(target=runner, name=f"gen-{name}", daemon=True)
+    t.start()
+    try:
+        print(f"[GEN THREAD START] time={time.time():.3f} gen_id={id(gen)} thread={t.name} active={threading.active_count()}", flush=True)
+        # explicit mapping print: which thread serves which binary (and id)
+        try:
+            print(f"[GEN THREAD MAP] pid={os.getpid()} thread_name={t.name} thread_ident={t.ident} -> binary={name}", flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return t
+
+def _get_from_queue(q, timeout, gen_id=None, tname=None):
+    """Get an item from q with timeout and print concise thread visibility lines."""
+    try:
+        item = q.get(timeout=timeout)
+        return item
+    except queue.Empty:
+        try:
+            print(f"[GEN THREAD TIMEOUT] time={time.time():.3f} gen_id={gen_id} thread={tname} timeout={timeout}s", flush=True)
+        except Exception:
+            pass
+        return ('timeout', None)
+
+
 def fuzz_binary(binary_name, max_time=50):
     print(f"\n[*] Fuzzing binary: {binary_name}")
     
@@ -178,15 +231,48 @@ def fuzz_binary(binary_name, max_time=50):
     iterations = 0
     start_time = time.time()
     
-    # Use the fuzzer's generator to get mutated inputs
-    for mutated in fuzzer.generate():
-        # iteration-level debug
-        if DEBUG_PRINT_PAYLOADS or FUZZ_DEBUG:
+    # Use the fuzzer's generator to get mutated inputs — start one persistent generator thread per binary
+    gen = fuzzer.generate()
+    # bounded queue -> prevents unbounded memory growth if generator outpaces consumer
+    gen_queue = queue.Queue(maxsize=GEN_QUEUE_MAX)
+    print(f"[GEN QUEUE] binary={binary_name} queue_max={GEN_QUEUE_MAX}, max_mutated_size={MAX_MUTATED_SIZE}, iter_sleep={ITER_SLEEP}", flush=True)
+    gen_thread = _start_generator_thread(gen, gen_queue, name=binary_name)
+    # quick snapshot of threads for visibility: name and identifier, plus process PID
+    try:
+        print(f"[THREADS SNAPSHOT] pid={os.getpid()} threads={[ (t.name, t.ident) for t in threading.enumerate() ]}", flush=True)
+    except Exception:
+        pass
+    while True:
+        kind, val = _get_from_queue(gen_queue, GENERATOR_YIELD_TIMEOUT, gen_id=id(gen), tname=gen_thread.name)
+        if kind == 'timeout':
+            print(f"[!] Fuzzer generator timed out after {GENERATOR_YIELD_TIMEOUT}s — skipping {binary_name}")
             try:
-                plen = len(mutated) if isinstance(mutated, (bytes, bytearray)) else 0
+                gen.close()
             except Exception:
-                plen = 0
-            print(f"[FUZZ DEBUG] binary={binary_name} iter={iterations+1} payload_len={plen} input_type={input_type}", flush=True)
+                pass
+            return crashes
+        if kind == 'stop':
+            break
+        if kind == 'error':
+            print(f"[!] Error from fuzzer generator: {val}")
+            return crashes
+
+        mutated = val
+        # ensure mutated is bytes and truncate overly large payloads to avoid spikes
+        try:
+            if isinstance(mutated, (bytes, bytearray)):
+                if len(mutated) > MAX_MUTATED_SIZE:
+                    mutated = bytes(mutated[:MAX_MUTATED_SIZE])
+            else:
+                # convert to bytes safely and truncate
+                mb = str(mutated).encode('utf-8', errors='ignore')
+                if len(mb) > MAX_MUTATED_SIZE:
+                    mb = mb[:MAX_MUTATED_SIZE]
+                mutated = mb
+        except Exception:
+            # fallback: use an empty payload on unexpected issues
+            mutated = b""
+        
         if (time.time() - start_time) >= max_time:
             break
         
@@ -335,16 +421,60 @@ def main() -> int:
         binaries.sort()
         print(f"[*] Fuzzing all binaries ({len(binaries)} total)")
     
-    # Fuzz each binary
-    for binary_name in binaries:
+    # Determine parallelism:
+    # - If FUZZ_PARALLEL env is set, use it.
+    # - Otherwise default to os.cpu_count() (logical CPUs) capped by number of binaries.
+    #   os.cpu_count() corresponds to your cores/hyperthreads (e.g., 4 on a 4-core VM).
+    workers_env = os.environ.get("FUZZ_PARALLEL", "").strip()
+    cpu = os.cpu_count() or 1
+    if workers_env:
         try:
-            crashes = fuzz_binary(binary_name, max_time=60)
-            save_results(binary_name, crashes)
-        except Exception as e:
-            print(f"[!] Error fuzzing {binary_name}: {e}")
-            import traceback
-            traceback.print_exc()
-    
+            workers = max(1, int(workers_env))
+        except Exception:
+            workers = 1
+    else:
+        # default: use up to cpu_count workers, but not more than number of binaries
+        workers = min(max(1, cpu), max(1, len(binaries)))
+    # Hard cap for safety during testing
+    HARD_WORKER_LIMIT = 2
+    workers_before_cap = workers
+    workers = 4
+    print(f"[*] Binaries to fuzz: {binaries}", flush=True)
+    print(f"[*] System logical CPUs (os.cpu_count()) = {cpu}", flush=True)
+    print(f"[*] FUZZ_PARALLEL env='{workers_env}' -> requested={workers_before_cap}, using_workers={workers} (hard cap {HARD_WORKER_LIMIT})", flush=True)
+
+    if workers <= 1:
+        # Serial (existing) behavior
+        for binary_name in binaries:
+            try:
+                crashes = fuzz_binary(binary_name, max_time=60)
+                save_results(binary_name, crashes)
+            except Exception as e:
+                print(f"[!] Error fuzzing {binary_name}: {e}")
+                import traceback
+                traceback.print_exc()
+    else:
+        # Parallel execution across binaries
+        print(f"[*] Running fuzzing in parallel with {workers} workers")
+        def _worker_task(name):
+            try:
+                crashes = fuzz_binary(name, max_time=60)
+                save_results(name, crashes)
+            except Exception as e:
+                print(f"[!] Error fuzzing {name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = { ex.submit(_worker_task, name): name for name in binaries }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    fut.result()
+                    print(f"[*] Finished {name}")
+                except Exception as e:
+                    print(f"[!] Worker error for {name}: {e}")
+
     print("\n" + "="*60)
     print("Fuzzing completed successfully")
     print("="*60)
