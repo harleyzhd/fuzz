@@ -1,7 +1,6 @@
 import subprocess
 import sys
 import os
-import random
 import time
 import json
 import copy
@@ -9,6 +8,17 @@ import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
 from pwn import process, remote, gdb, args, context, u64, asm
+
+from fuzzers import (
+    BaseFuzzer,
+    PlaintextFuzzer,
+    JsonFuzzer,
+    XmlFuzzer,
+    CsvFuzzer,
+    JpegFuzzer,
+    ElfFuzzer,
+    PdfFuzzer,
+)
 
 context.log_level = 'error'  # Reduce pwn noise
 context.update(arch='amd64', os='linux')
@@ -46,567 +56,6 @@ def start(binary_name, argv=[], *a, **kwargs):
         return remote(sys.argv[1], sys.argv[2], *a, **kwargs)
     else:
         return process([str(binary_path)] + argv, *a, **kwargs)
-
-
-# Base Fuzzer Class
-class BaseFuzzer:
-    """Base class for all format-specific fuzzers."""
-    
-    def __init__(self, example_input):
-        """Initialize the fuzzer with example input data."""
-        self.example_input = example_input
-        try:
-            self.parsed_data = self.parse_input(example_input)
-        except Exception as exc:
-            print(f"[!] Error parsing input: {exc}")
-            self.parsed_data = None
-    
-    def parse_input(self, data):
-        """Parse the input data. Override in subclasses."""
-        return data
-    
-    def generate(self):
-        """Generator that yields mutated inputs. Override in subclasses."""
-        # Default: yield byte-level mutations
-        while True:
-            yield self.mutate_bytes(self.example_input)
-    
-    # claude generated
-    def mutate_bytes(self, data):
-        """Apply generic byte-level mutations."""
-        if not data:
-            return data
-        
-        mutation_type = random.randint(0, 5)
-        data = bytearray(data)
-        
-        if mutation_type == 0:  # Bit flip
-            if len(data) > 0:
-                pos = random.randint(0, len(data) - 1)
-                data[pos] ^= (1 << random.randint(0, 7))
-        elif mutation_type == 1:  # Byte flip
-            if len(data) > 0:
-                pos = random.randint(0, len(data) - 1)
-                data[pos] = random.randint(0, 255)
-        elif mutation_type == 2:  # Insert random byte
-            pos = random.randint(0, len(data))
-            data.insert(pos, random.randint(0, 255))
-        elif mutation_type == 3:  # Delete byte
-            if len(data) > 1:
-                pos = random.randint(0, len(data) - 1)
-                del data[pos]
-        elif mutation_type == 4:  # Duplicate chunk
-            if len(data) > 0:
-                chunk_len = min(random.randint(1, 10), len(data))
-                pos = random.randint(0, len(data) - chunk_len)
-                chunk = data[pos:pos + chunk_len]
-                data.extend(chunk * random.randint(2, 10))
-        elif mutation_type == 5:  # Insert special values
-            special_values = [0, 255, 127, 128, b'\x00', b'\xff', b'\n', b'\r']
-            pos = random.randint(0, len(data))
-            val = random.choice(special_values)
-            if isinstance(val, bytes):
-                data[pos:pos] = val
-            else:
-                data.insert(pos, val)
-        
-        return bytes(data)
-
-
-class PlaintextFuzzer(BaseFuzzer):
-    """Fuzzer for plaintext inputs."""
-    
-    def generate(self):
-        """Generate mutated plaintext inputs."""
-        while True:
-            # TODO: Implement plaintext-specific mutations
-            # - Line insertions/deletions
-            # - Word boundary mutations
-            # - Newline/whitespace fuzzing
-            yield self.mutate_bytes(self.example_input)
-
-
-class JsonFuzzer(BaseFuzzer):
-    """Fuzzer for JSON inputs."""
-    
-    def __init__(self, example_input):
-        """Initialize the JSON fuzzer."""
-        super().__init__(example_input)
-        self._json = self.parsed_data
-    
-    def parse_input(self, data):
-        """Parse JSON data."""
-        return json.loads(data.decode('utf-8'))
-    
-    def generate_format_strings(self, json_dict):
-        """Generate format string variations in JSON values."""
-        for key, value in json_dict.items():
-            if isinstance(value, str):
-                json_dict[key] = '%s' * 10
-            elif isinstance(value, list):
-                json_dict[key] = []
-            elif isinstance(value, dict):
-                json_dict[key] = self.generate_format_strings(value)
-        return json_dict
-    
-    def byteflip(self, json_data):
-        """Apply byte flips to JSON string representation."""
-        b = bytearray(json_data, 'UTF-8')
-        
-        for i in range(0, len(b)):
-            # Change 1 in 20 bytes
-            if random.randint(0, 20) == 1:
-                b[i] ^= random.getrandbits(7)
-        
-        return b.decode('ascii')
-    
-    def generate(self):
-        """Generate mutated JSON inputs."""
-        import copy
-        
-        # First, try sending empty file
-        yield b""
-        
-        # Now send invalid json
-        yield b"A" * 1000
-        
-        # Now send format strings
-        yield json.dumps(
-            self.generate_format_strings(copy.deepcopy(self._json))
-        ).encode('utf-8')
-        
-        # Maybe try some random bit flips?
-        while True:
-            yield self.byteflip(json.dumps(self._json)).encode('utf-8', errors='ignore')
-
-class XmlFuzzer(BaseFuzzer):
-    #I cannot get any of these binaries to crash, i've spent like 15 hours on this and nothing is working
-    def __init__(self, example_input):
-        super().__init__(example_input)
-
-        # Store raw seed bytes without losing invalid UTF-8
-        if isinstance(example_input, (bytes, bytearray)):
-            self._seed_bytes = bytes(example_input)
-        else:
-            self._seed_bytes = example_input.encode("utf-8", errors="surrogateescape")
-
-        # Parse XML only if valid UTF-8
-        try:
-            self._xml = ET.fromstring(self._seed_bytes.decode("utf-8"))
-        except Exception:
-            self._xml = None
-
-    # Basic byte-level mutators
-    def byteflip(self, xml_bytes, flip_prob=0.05):
-        b = bytearray(xml_bytes)
-        for i in range(len(b)):
-            if random.random() < flip_prob:
-                b[i] ^= random.getrandbits(8)
-        return bytes(b)
-
-    def inject_invalid_utf8(self, xml_bytes, count=10):
-        b = bytearray(xml_bytes)
-        for _ in range(count):
-            pos = random.randint(0, len(b) - 1 if len(b) else 0)
-            b.insert(pos, random.choice([0xC0, 0xC1, 0xF5, 0xFF]))
-        return bytes(b)
-
-    # XML structural mutations
-    def mutate_tag_names(self, xml_bytes, max_len=50):
-        s = xml_bytes.decode("latin-1")
-
-        def repl(m):
-            slash = m.group("slash") or ""
-            nlen = random.randint(1, max_len)
-            newname = "".join(
-                random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-:")
-                for _ in range(nlen)
-            )
-            return f"<{slash}{newname}"
-
-        s = re.sub(
-            r"<(?P<slash>/?)(?P<name>[A-Za-z_:][A-Za-z0-9_.:-]*)", repl, s
-        )
-        return s.encode("latin-1")
-
-    def mutate_attributes(self, xml_bytes, add_long_attrs=True):
-        s = xml_bytes.decode("latin-1")
-
-        # Expand existing attributes
-        s = re.sub(
-            r'(?P<name>[A-Za-z_:][A-Za-z0-9_.:-]*)=("|\')(?P<val>.*?)(\2)',
-            lambda m: f'{m.group("name")}={m.group(2)}{m.group("val")}' +
-            ("A" * random.randint(200, 2000)) +
-            f'{m.group(2)}',
-            s
-        )
-
-        # Add massive attribute lists
-        if add_long_attrs:
-            def add_attrs(m):
-                extras = " ".join(
-                    f'attr{i}="{ "A"*random.randint(200,2000) }"'
-                    for i in range(random.randint(0, 20))
-                )
-                return m.group(0) + " " + extras
-
-            s = re.sub(
-                r"<([A-Za-z_:][A-Za-z0-9_.:-]*)(\s|>)",
-                add_attrs,
-                s,
-                count=1
-            )
-
-        return s.encode("latin-1")
-
-    # Deep structural expansions
-    def generate_deep_nesting(self, depth=1000):
-        depth = min(depth, 20000)
-        xml = []
-        for i in range(depth):
-            xml.append(f"<a{i}>")
-        xml.append("X")
-        for i in reversed(range(depth)):
-            xml.append(f"</a{i}>")
-        return "".join(xml).encode("utf-8")
-
-    def generate_entity_bomb(self):
-        xml = """<!DOCTYPE lolz [
-<!ENTITY a "AAAAAAAAAA">
-<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">
-<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
-<!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
-<!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
-]>"""
-        xml += "<root>&e;</root>"
-        return xml.encode("utf-8")
-
-    def generate_external_entity(self, uri="file:///etc/passwd"):
-        xml = f"""<!DOCTYPE root [
-<!ENTITY ext SYSTEM "{uri}">
-]>
-<root>&ext;</root>"""
-        return xml.encode("utf-8")
-
-    def random_long_tag(self, length=10000):
-        return (
-            "<" + ("T" * length) + ">X</" + ("T" * length) + ">"
-        ).encode("utf-8")
-
-    # CDATA, comments, headers
-    def inject_cdata(self, xml_bytes):
-        s = xml_bytes.decode("latin-1")
-        cdata = "<![CDATA[" + ("A" * random.randint(50, 200)) + "]]>"
-        pos = random.randint(0, len(s))
-        return (s[:pos] + cdata + s[pos:]).encode("latin-1")
-
-    def inject_comments(self, xml_bytes):
-        s = xml_bytes.decode("latin-1")
-        comment = "<!-- " + ("X" * random.randint(50, 200)) + " -->"
-        pos = random.randint(0, len(s))
-        return (s[:pos] + comment + s[pos:]).encode("latin-1")
-
-    def mangled_xml_header(self, xml_bytes):
-        headers = [
-            '<?xml version="1.0" encoding="????">',
-            '<?xml version="9.9" encoding="UTF-16">',
-            '<?xml version="1.0" encoding="UTF-8" standalone="maybe">',
-            '<?xml\x00version="1.0">',
-        ]
-        return random.choice(headers).encode() + xml_bytes
-
-    # Mismatches, illegal entities
-    def generate_mismatched_tags(self, xml_bytes):
-        s = xml_bytes.decode("latin-1")
-        s = re.sub(r"</(\w+)>", r"<\1>", s)
-        return s.encode("latin-1")
-
-    def inject_illegal_entities(self, xml_bytes):
-        s = xml_bytes.decode("latin-1")
-        illegal = ["&lt", "&gt", "&amp", "&", "<![CDATA[", "<!--", "<!ENTITY"]
-        endings = [">", ";", "\"", "'"]
-        for ent in illegal:
-            s = s.replace(ent, f"{ent}{random.choice(endings)}")
-        return s.encode("latin-1")
-
-    def generate(self):
-        # Base seed
-        if self._xml is not None:
-            seed = ET.tostring(self._xml, encoding="utf-8")
-        else:
-            seed = self._seed_bytes or b"<root>seed</root>"
-
-        # Basic inputs
-        yield b"" + b"\x00" 
-        yield b"<" * 10000 + b"\x00" 
-
-        while True:
-            r = random.random()
-
-            if r < 0.10:
-                yield self.byteflip(seed) + b"\x00" 
-
-            elif r < 0.20:
-                yield self.inject_invalid_utf8(seed) + b"\x00" 
-
-            elif r < 0.30:
-                yield self.mutate_tag_names(seed) + b"\x00" 
-
-            elif r < 0.40:
-                yield self.mutate_attributes(seed) + b"\x00" 
-
-            elif r < 0.45:
-                yield self.generate_deep_nesting(random.randint(50, 5000)) + b"\x00" 
-
-            elif r < 0.50:
-                yield self.generate_entity_bomb() + b"\x00" 
-
-            elif r < 0.55:
-                yield self.generate_external_entity() + b"\x00" 
-
-            elif r < 0.60:
-                yield self.inject_cdata(seed) + b"\x00" 
-
-            elif r < 0.65:
-                yield self.inject_comments(seed) + b"\x00" 
-
-            elif r < 0.70:
-                yield self.mangled_xml_header(seed) + b"\x00" 
-
-            elif r < 0.75:
-                yield self.generate_mismatched_tags(seed) + b"\x00" 
-
-            elif r < 0.80:
-                yield self.inject_illegal_entities(seed) + b"\x00" 
-
-            elif r < 0.85:
-                yield self.random_long_tag(random.choice([512, 2048, 65536])) + b"\x00" 
-
-            else:
-                # Mutation chain for more chaos
-                b = seed
-                funcs = [
-                    self.byteflip,
-                    self.inject_invalid_utf8,
-                    self.mutate_tag_names,
-                    self.mutate_attributes,
-                    self.inject_cdata,
-                    self.inject_comments,
-                ]
-                for _ in range(random.randint(2, 5)):
-                    b = random.choice(funcs)(b)
-                yield b + b"\x00" 
-
-class CsvFuzzer(BaseFuzzer):
-
-    def parse_input(self, data):
-        try:
-            txt = data.decode('utf-8', errors='ignore')
-            lines = txt.splitlines()
-            return [ln for ln in lines]
-        except Exception:
-            return None
-
-    def _seed_text(self):
-        return (self.example_input.decode('utf-8', errors='ignore')
-                if isinstance(self.example_input, (bytes, bytearray))
-                else str(self.example_input))
-
-    def _rows_to_bytes(self, rows, delim=','):
-        s = "\n".join(delim.join(r) for r in rows) + "\n"
-        return s.encode('utf-8', errors='ignore')
-
-    def _append_after_seed_text(self, suffix_text):
-        seed = self._seed_text()
-        if not seed.endswith("\n"):
-            seed += "\n"
-        return (seed + suffix_text).encode('utf-8', errors='ignore')
-
-    def _pick_template_row(self, lines):
-        # choose the line with most commas (most fields) as template
-        if not lines:
-            return ["a","b","c"]
-        best = max(lines, key=lambda l: l.count(','))
-        return best.split(',')
-
-    def _mutate_field(self, s):
-        s = s or ""
-        r = random.randint(0, 6)
-        if r == 0:
-            return ""
-        if r == 1:
-            return (s[:3] or "x")
-        if r == 2:
-            return "A" * random.choice([8, 16, 64, 200, 500])
-        if r == 3:
-            return str(random.randint(0, 2**31-1))
-        if r == 4:
-            return f'"{s or "A"}"'
-        if r == 5:
-            return (s or "Z") + "\\n" + "Z"
-        return (s.replace(",", ";") if s else ";")
-
-    def _mutate_row_fields(self, base_row):
-        row = []
-        for f in base_row:
-            row.append(self._mutate_field(f))
-        # small chance to add/delete columns
-        if random.random() < 0.10:
-            for _ in range(random.randint(1, 2)):
-                row.append(self._mutate_field(""))
-        if random.random() < 0.03 and len(row) > 1:
-            del row[random.randrange(len(row))]
-        return row
-
-    def _make_block_vary_each_field(self, base_row, nrows):
-        return [self._mutate_row_fields(base_row) for _ in range(nrows)]
-
-    
-    def mutation_in_row(self, data, times):
-        
-        import copy
-        if not data or not data[0]:
-            return data
-        data = copy.deepcopy(data)
-
-        
-        pool = ["!", "@", "#", "$", "%", "^", "&", "*", "?", ";", "|"]
-
-        row_mutators = [
-            lambda row: row + [random.choice(pool)],                     
-            lambda row: (row[::-1] if len(row) > 1 else row),           
-            lambda row: (row[:-1] if len(row) > 1 else row),            
-            lambda row: (row[1:] if len(row) > 1 else row),             
-            lambda row: [],                                             
-            lambda row: row * random.randint(250, 500),                 
-        ]
-
-        counter = 0
-        while counter < times:
-            op = random.choice(row_mutators)
-            r = random.randrange(len(data))
-            try:
-                data[r] = op(data[r])
-                counter += 1
-            except (IndexError, ValueError, TypeError):
-                continue
-        return data
-
-    def _repeat_last_line_block(self, lines, counts):
-        if not lines:
-            return []
-        last = lines[-1] if lines[-1].strip() else (lines[-2] if len(lines) >= 2 else lines[-1])
-        if last.strip() == "":
-            last = "a,b,c,A"
-        payloads = []
-        for n in counts:
-            block = ("\n".join([last for _ in range(n)]) + "\n")
-            payloads.append(self._append_after_seed_text(block))
-        return payloads
-
-    def _append_growing_last_field(self, template_line, steps=12):
-        parts = template_line.split(",")
-        if len(parts) == 0:
-            parts = ["A"]
-        if len(parts) == 1:
-            parts.append("A")
-        lines = []
-        for i in range(steps):
-            p = parts[:]
-            p[-1] = "A" * max(1, i * 10)
-            lines.append(",".join(p))
-        block = "\n".join(lines) + "\n"
-        return self._append_after_seed_text(block)
-
-    def generate(self):
-        yield b""                                 # empty
-        yield self.example_input                  # seed unchanged
-        yield (b"A" * 2000)                       # size stress single-field appended
-
-        seed_lines = self.parse_input(self.example_input) or []
-        template = self._pick_template_row(seed_lines)
-        block = self._make_block_vary_each_field(template, nrows=random.randint(6, 18))
-        yield self._append_after_seed_text("\n".join([",".join(r) for r in block]) + "\n")
-
-        block_sc = self._make_block_vary_each_field(template, nrows=random.randint(4, 12))
-        yield self._append_after_seed_text("\n".join([(";".join(r)) for r in block_sc]) + "\n")
-
-        if seed_lines:
-            template_line = seed_lines[-1] if seed_lines[-1].strip() else (seed_lines[0] if seed_lines else "a,b,c,A")
-            yield self._append_growing_last_field(template_line, steps=12)
-
-        for p in self._repeat_last_line_block(seed_lines, counts=[5, 10, 50, 100, 150]):
-            yield p
-
-        if seed_lines:
-            last = seed_lines[-1] if seed_lines[-1].strip() else (seed_lines[0] if seed_lines else "a,b,c,A")
-            semi_block = "\n".join([last.replace(",", ";") for _ in range(20)]) + "\n"
-            yield self._append_after_seed_text(semi_block)
-
-        if seed_lines:
-            seed_rows = [ln.split(",") for ln in seed_lines if ln.strip()]
-        else:
-            seed_rows = [["a","b","c","A"]]
-        mutated_rows = self.mutation_in_row(seed_rows, times=random.randint(3, 10))
-        try:
-            yield self._append_after_seed_text(self._rows_to_bytes(mutated_rows).decode('utf-8', errors='ignore'))
-        except Exception:
-            pass
-
-        for rate in (20, 40):
-            b = bytearray(self.example_input)
-            for i in range(len(b)):
-                if random.randint(0, rate) == 1:
-                    b[i] ^= random.getrandbits(7)
-            yield bytes(b)
-
-        for _ in range(25):
-            yield self.mutate_bytes(self.example_input)
-
-        while True:
-            yield self.mutate_bytes(self.example_input)
-
-
-class JpegFuzzer(BaseFuzzer):
-    """Fuzzer for JPEG inputs."""
-    
-    def generate(self):
-        """Generate mutated JPEG inputs."""
-        while True:
-            # TODO: Implement JPEG-specific mutations
-            # - Header corruption
-            # - Marker manipulation
-            # - EXIF data fuzzing
-            # - Huffman table corruption
-            yield self.mutate_bytes(self.example_input)
-
-
-class ElfFuzzer(BaseFuzzer):
-    """Fuzzer for ELF inputs."""
-    
-    def generate(self):
-        """Generate mutated ELF inputs."""
-        while True:
-            # TODO: Implement ELF-specific mutations
-            # - Header field mutations
-            # - Section header fuzzing
-            # - Program header fuzzing
-            # - Symbol table corruption
-            yield self.mutate_bytes(self.example_input)
-
-
-class PdfFuzzer(BaseFuzzer):
-    """Fuzzer for PDF inputs."""
-    
-    def generate(self):
-        """Generate mutated PDF inputs."""
-        while True:
-            # TODO: Implement PDF-specific mutations
-            # - Object stream corruption
-            # - Cross-reference table fuzzing
-            # - JavaScript injection
-            # - Embedded file fuzzing
-            yield self.mutate_bytes(self.example_input)
 
 
 def detect_input_type(data):
@@ -658,7 +107,6 @@ def detect_input_type(data):
 
 
 def get_fuzzer_class(input_type):
-    """Return the appropriate fuzzer class for the given input type."""
     fuzzer_map = {
         'PLAINTEXT': PlaintextFuzzer,
         'JSON': JsonFuzzer,
@@ -671,8 +119,7 @@ def get_fuzzer_class(input_type):
     return fuzzer_map.get(input_type, BaseFuzzer)
 
 
-def fuzz_binary(binary_name, max_time=60):
-    """Fuzz a single binary and return results."""
+def fuzz_binary(binary_name, max_time=50):
     print(f"\n[*] Fuzzing binary: {binary_name}")
     
     # Load the valid input
@@ -730,18 +177,51 @@ def fuzz_binary(binary_name, max_time=60):
                     result = p.poll(block=False)  # type: ignore
                     if result is None:
                         # Still running, wait a bit
+<<<<<<< HEAD
                         time.sleep(0.5)
                         result = p.poll(block=False)  # type: ignore
+=======
+                        time.sleep(0.1)
+                        result = p.poll(block=False)  # type: ignore check failure
+
+                    is_crash = False
+                    crash_reason = None
+>>>>>>> a5d860f182d1d8460b19aadd8bd6eaf3fb4fee58
                     
-                    # Check if it crashed (non-zero exit)
-                    # Exit code -6 is SIGABRT (abort()), which doesn't count as a crash
-                    if result is not None and result != 0 and result != -6:
-                        crashes.append({
+                    if result is not None and result != 0 and result != 1:
+                        # Any non-zero, non-1 exit code is a crash
+                        is_crash = True
+                        
+                        # Try to get more specific crash reason
+                        if result == -6:
+                            crash_reason = "SIGABRT (signal 6)"
+                            try:
+                                output = p.recvall(timeout=0.1).decode('utf-8', errors='ignore')
+                                if 'stack smashing detected' in output.lower() or 'stack check' in output.lower():
+                                    crash_reason = "Stack smashing detected (SIGABRT)"
+                            except:
+                                pass
+                        elif result < 0:
+                            crash_reason = f"Signal {result}"
+                        else:
+                            crash_reason = f"Exit code {result}"
+                    
+                    if is_crash:
+                        crash_info = {
                             'input': mutated,
                             'exit_code': result,
                             'iteration': iterations
-                        })
-                        print(f"[+] Crash found! Exit code: {result}, Iteration: {iterations}")
+                        }
+                        if crash_reason:
+                            crash_info['reason'] = crash_reason
+                        crashes.append(crash_info)
+                        print(f"[+] Crash found! {crash_reason}, Iteration: {iterations}")
+                        try:
+                            p.close()
+                        except Exception:
+                            pass
+                        # stop fuzzing this binary, move to next
+                        return crashes
             except Exception:
                 pass
             
@@ -756,6 +236,8 @@ def fuzz_binary(binary_name, max_time=60):
                     'iteration': iterations
                 })
                 print(f"[+] Crash found! Error: {str(e)[:50]}, Iteration: {iterations}")
+                # stop fuzzing this binary, move to next
+                return crashes
         
         if iterations % 100 == 0:
             print(f"[*] Iterations: {iterations}, Time: {int(time.time() - start_time)}s")
