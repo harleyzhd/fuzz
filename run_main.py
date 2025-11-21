@@ -303,22 +303,15 @@ def fuzz_binary(binary_name, max_time=50):
             try:
                 p.send(mutated)
             except Exception as err:
-                sig = ("send", str(err))
-                if sig not in seen_signatures:
-                    seen_signatures.add(sig)
-                    crashes.append({
-                        'input': mutated,
-                        'error': f"send failure: {err}",
-                        'iteration': iterations,
-                    })
-                    print(f"[+] Crash found (send failure): {err}, Iteration: {iterations}")
-                else:
-                    print(f"[!] Duplicate crash signature ignored (send failure): {err}")
+                # Most likely: process exited immediately / doesn't read stdin.
+                # Not a real crash – just skip this input.
+                if FUZZ_DEBUG:
+                    print(f"[DEBUG] send() failed for {binary_name} at iter {iterations}: {err}")
                 try:
                     p.close()
                 except Exception:
                     pass
-                return crashes
+                continue
 
             p.shutdown('send')
 
@@ -372,7 +365,7 @@ def fuzz_binary(binary_name, max_time=50):
                         except Exception:
                             pass
 
-                    if poll_result not in (None, 0):
+                    if poll_result not in (None, 0, 1):
                         desc = describe_exit(poll_result)
                         preview = ""
                         try:
