@@ -4,7 +4,7 @@
 echo "Launching Python fuzzer runner..."
 
 if command -v python3 >/dev/null 2>&1; then
-    python3 /run_main.py "$@"
+    python3 run_main.py "$@"
     rc=$?
 else
     echo "Error: python3 is not installed in the container."
