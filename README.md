@@ -10,17 +10,8 @@ If you want to test specific binary use `python3 run_main.py FILE_NAME`
 
 To fuzz all binaries use `python3 run_main.py`
 
-# Have an idea?
+# Input types
 
-If you have idea for some specific input type, go to the respective fuzzer class and implement it there.
+This fuzzer is capable of fuzzing plaintext, JSON, CSV, XML, JPEG, ELF and PDF.
 
-# Old readme
-This folder is a possible example submission.
-
-As a student **you can change any file in this directory except for run_fuzzer.sh**.
-
-We will be providing the `run_fuzzer.sh` file.
-
-You must supply a folder with at least a DockerFile that describes how to build/compile/run your fuzzer.
-
-See the assignment spec for more details.
+For further information on how this fuzzer works please check the writeup.md file
