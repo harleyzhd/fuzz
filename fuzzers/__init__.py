@@ -10,6 +10,7 @@ from .csv_fuzzer import CsvFuzzer
 from .jpeg_fuzzer import JpegFuzzer
 from .elf_fuzzer import ElfFuzzer
 from .pdf_fuzzer import PdfFuzzer
+from .onnx_fuzzer import OnnxFuzzer
 
 __all__ = [
     'BaseFuzzer',
@@ -20,4 +21,5 @@ __all__ = [
     'JpegFuzzer',
     'ElfFuzzer',
     'PdfFuzzer',
+    'OnnxFuzzer',
 ]

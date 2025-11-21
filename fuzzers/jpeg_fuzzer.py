@@ -108,6 +108,94 @@ class JpegFuzzer(BaseFuzzer):
 
         return bytes(data)
 
+    def _seed_huffman_overflow(self, source=None, min_total=0x120):
+        blob = bytearray(source if source is not None else self.example_input)
+        if not blob:
+            return None
+        dht_pos = blob.find(b'\xff\xc4')
+        if dht_pos == -1 or dht_pos + 4 >= len(blob):
+            return None
+        length = struct.unpack('>H', blob[dht_pos + 2:dht_pos + 4])[0]
+        body_end = dht_pos + 2 + length
+        if body_end > len(blob):
+            return None
+        info = blob[dht_pos + 4]
+        counts = list(blob[dht_pos + 5:dht_pos + 21])
+        if len(counts) != 16:
+            return None
+        total = sum(counts)
+        extra_needed = max(0, min_total - total)
+        new_counts = counts[:]
+        idx = 0
+        while extra_needed > 0 and idx < len(new_counts):
+            add = min(0xFF - new_counts[idx], extra_needed)
+            new_counts[idx] += add
+            extra_needed -= add
+            idx += 1
+        if sum(new_counts) == total:
+            return None
+        symbols = bytes((i & 0xff) for i in range(sum(new_counts)))
+        new_body = bytes([info]) + bytes(new_counts) + symbols
+        new_length = len(new_body)
+        mutated = (
+            blob[:dht_pos + 2]
+            + struct.pack('>H', new_length)
+            + new_body
+            + blob[body_end:]
+        )
+        return bytes(mutated)
+
+    def _seed_dqt_overflow(self, source=None, extra_len=0x100):
+        blob = bytearray(source if source is not None else self.example_input)
+        if not blob:
+            return None
+        dqt_pos = blob.find(b'\xff\xdb')
+        if dqt_pos == -1 or dqt_pos + 4 >= len(blob):
+            return None
+        length = struct.unpack('>H', blob[dqt_pos + 2:dqt_pos + 4])[0]
+        body_end = dqt_pos + 2 + length
+        if body_end > len(blob):
+            return None
+        info = blob[dqt_pos + 4]
+        payload = bytes([info]) + bytes([random.randint(0, 255) for _ in range(length - 1 + extra_len)])
+        new_length = len(payload)
+        mutated = (
+            blob[:dqt_pos + 2]
+            + struct.pack('>H', new_length)
+            + payload
+            + blob[body_end:]
+        )
+        return bytes(mutated)
+
+    def _seed_sos_component_mismatch(self, source=None):
+        blob = bytearray(source if source is not None else self.example_input)
+        if not blob:
+            return None
+        sos_pos = blob.find(b'\xff\xda')
+        if sos_pos == -1 or sos_pos + 5 >= len(blob):
+            return None
+        length = struct.unpack('>H', blob[sos_pos + 2:sos_pos + 4])[0]
+        end = sos_pos + 2 + length
+        if end > len(blob):
+            return None
+        ns = blob[sos_pos + 4]
+        comp_bytes = bytearray(blob[sos_pos + 5:sos_pos + 5 + 2 * ns])
+        tail = blob[sos_pos + 5 + 2 * ns:end]
+        comp_bytes.extend([0x0A, 0xFF])
+        comp_bytes.extend([0x0B, 0xEE])
+        new_ns = ns + 2 if ns <= 4 else ns + 1
+        comp_bytes = comp_bytes[:2 * new_ns]
+        new_length = 6 + 2 * new_ns
+        mutated = (
+            blob[:sos_pos + 2]
+            + struct.pack('>H', new_length)
+            + bytes([new_ns])
+            + bytes(comp_bytes)
+            + tail
+            + blob[end:]
+        )
+        return bytes(mutated)
+
     def _corrupt_sof(self, data):
         data = bytearray(data)
         sof_markers = [b'\xff\xc0', b'\xff\xc1', b'\xff\xc2']
@@ -404,6 +492,19 @@ class JpegFuzzer(BaseFuzzer):
         yield b""
         yield self.example_input
 
+        seeds = [
+            self._seed_huffman_overflow(),
+            self._seed_dqt_overflow(),
+            self._seed_sos_component_mismatch(),
+        ]
+        for seed in seeds:
+            if seed:
+                yield seed
+        for _ in range(4):
+            overflow = self._seed_huffman_overflow(min_total=0x160 + random.randint(0, 0x100))
+            if overflow:
+                yield overflow
+
         for p in self._generate_malformed_headers():
             yield p
 
@@ -430,6 +531,10 @@ class JpegFuzzer(BaseFuzzer):
 
         for _ in range(10):
             yield self._corrupt_huffman_table(self.example_input)
+        for _ in range(5):
+            overflow = self._seed_huffman_overflow(min_total=0x1A0 + random.randint(0, 0x80))
+            if overflow:
+                yield overflow
 
         for _ in range(20):
             yield self._corrupt_sof(self.example_input)
@@ -466,9 +571,15 @@ class JpegFuzzer(BaseFuzzer):
 
         for _ in range(20):
             yield self._corrupt_component_ids(self.example_input)
+        dqt_seed = self._seed_dqt_overflow(extra_len=0x80)
+        if dqt_seed:
+            yield dqt_seed
+        sos_seed = self._seed_sos_component_mismatch()
+        if sos_seed:
+            yield sos_seed
 
         while True:
-            mutation_type = random.randint(0, 16)
+            mutation_type = random.randint(0, 18)
 
             if mutation_type == 0:
                 yield self.mutate_bytes(self.example_input)
@@ -484,7 +595,11 @@ class JpegFuzzer(BaseFuzzer):
             elif mutation_type == 3:
                 yield self._corrupt_quantization_table(self.example_input)
             elif mutation_type == 4:
-                yield self._corrupt_huffman_table(self.example_input)
+                overflow = self._seed_huffman_overflow(min_total=0x200 + random.randint(0, 0x200))
+                if overflow:
+                    yield overflow
+                else:
+                    yield self._corrupt_huffman_table(self.example_input)
             elif mutation_type == 5:
                 yield self._corrupt_sof(self.example_input)
             elif mutation_type == 6:
@@ -509,3 +624,15 @@ class JpegFuzzer(BaseFuzzer):
                 yield self._valid_dims_with_corruption(self.example_input)
             elif mutation_type == 16:
                 yield self._corrupt_component_ids(self.example_input)
+            elif mutation_type == 17:
+                dqt_over = self._seed_dqt_overflow(extra_len=0x120)
+                if dqt_over:
+                    yield dqt_over
+                else:
+                    yield self._corrupt_quantization_table(self.example_input)
+            elif mutation_type == 18:
+                sos_over = self._seed_sos_component_mismatch()
+                if sos_over:
+                    yield sos_over
+                else:
+                    yield self._corrupt_sos(self.example_input)

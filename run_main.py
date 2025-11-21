@@ -1,8 +1,10 @@
+import argparse
 import subprocess
 import sys
 import os
 import time
 import json
+import onnx
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +21,7 @@ from fuzzers import (
     JpegFuzzer,
     ElfFuzzer,
     PdfFuzzer,
+    OnnxFuzzer,
 )
 
 context.log_level = 'error'  # Reduce pwn noise
@@ -49,17 +52,21 @@ gdb_script = """
 
 """
 
-def start(binary_name, argv=[], *a, **kwargs):
-    """Start a process for the given binary."""
-    binary_path = BINARIES_PATH / binary_name
+def start(binary_name, argv=[], *a, binary_override=None, **kwargs):
+    binary_path = Path(binary_override) if binary_override else (BINARIES_PATH / binary_name)
+    cmd = [str(binary_path)]
+    if binary_override and binary_path.suffix == ".py" and not os.access(binary_path, os.X_OK):
+        cmd = [sys.executable, str(binary_path)]
+    if not binary_path.exists():
+        raise FileNotFoundError(f"binary not found: {binary_path}")
     if args.GDB:
-        return gdb.debug([str(binary_path)] + argv, gdbscript=gdb_script, *a, **kwargs)
+        return gdb.debug(cmd + argv, gdbscript=gdb_script, *a, **kwargs)
     elif args.REMOTE:
         # probably dont need this lol
         return remote(sys.argv[1], sys.argv[2], *a, **kwargs)
     else:
         return process(
-            [str(binary_path)] + argv,
+            cmd + argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -68,7 +75,7 @@ def start(binary_name, argv=[], *a, **kwargs):
         )
 
 
-def detect_input_type(data):
+def detect_input_type(data, filename=None):
     """Detect the input format type from the data."""
     # Check for ELF
     if data.startswith(b'\x7fELF'):
@@ -112,7 +119,8 @@ def detect_input_type(data):
     except:
         pass
     
-    # Default to plaintext
+    if filename and filename.lower().endswith(".onnx"):
+        return 'ONNX'
     return 'PLAINTEXT'
 
 
@@ -125,6 +133,7 @@ def get_fuzzer_class(input_type):
         'JPEG': JpegFuzzer,
         'ELF': ElfFuzzer,
         'PDF': PdfFuzzer,
+        'ONNX': OnnxFuzzer,
     }
     return fuzzer_map.get(input_type, BaseFuzzer)
 
@@ -210,13 +219,12 @@ def _get_from_queue(q, timeout, gen_id=None, tname=None):
         return ('timeout', None)
 
 
-def fuzz_binary(binary_name, max_time=50):
+def fuzz_binary(binary_name, max_time=50, input_path=None, binary_override=None):
     print(f"\n[*] Fuzzing binary: {binary_name}")
     
-    # Load the valid input
-    input_file = INPUTS_PATH / f"{binary_name}.txt"
+    input_file = Path(input_path) if input_path else (INPUTS_PATH / f"{binary_name}.txt")
     if not input_file.exists():
-        print(f"[!] No example input found for {binary_name}")
+        print(f"[!] No example input found for {binary_name} at {input_file}")
         return []
     
     with open(input_file, 'rb') as f:
@@ -225,7 +233,7 @@ def fuzz_binary(binary_name, max_time=50):
     print(f"[*] Loaded valid input ({len(valid_input)} bytes)")
     
     # Detect input type
-    input_type = detect_input_type(valid_input)
+    input_type = detect_input_type(valid_input, filename=input_file.name)
     print(f"[*] Detected input type: {input_type}")
     
     # Get appropriate fuzzer class and instantiate it
@@ -298,8 +306,21 @@ def fuzz_binary(binary_name, max_time=50):
                 print(f"[DEBUG] Payload (first 100 bytes): {mutated[:100]}...")
         
         try:
+            if input_type == 'ONNX':
+                try:
+                    onnx.load_model_from_string(mutated)
+                except Exception as exc:
+                    crash_info = {
+                        'input': mutated,
+                        'exit_code': -6,
+                        'iteration': iterations,
+                        'desc': f"onnx parse error: {exc}",
+                    }
+                    crashes.append(crash_info)
+                    print(f"[+] ONNX parse error treated as crash: {exc}, Iteration: {iterations}")
+                    return crashes
             # Run the binary with mutated input
-            p = start(binary_name)
+            p = start(binary_name, binary_override=binary_override)
             try:
                 p.send(mutated)
             except Exception as err:
@@ -380,6 +401,13 @@ def fuzz_binary(binary_name, max_time=50):
                         except Exception:
                             preview = "<binary output>"
 
+                        if poll_result == 1 and input_type == 'PLAINTEXT':
+                            try:
+                                p.close()
+                            except Exception:
+                                pass
+                            continue
+
                         abort_pattern = (
                             "stack smashing detected",
                             "__stack_chk_fail",
@@ -456,7 +484,8 @@ def save_results(binary_name, crashes):
     """Save fuzzing results to output file."""
     OUTPUT_PATH.mkdir(exist_ok=True)
     output_file = OUTPUT_PATH / f"{binary_name}.txt"
-    
+    json_file = OUTPUT_PATH / f"{binary_name}.json"
+
     with open(output_file, 'w') as f:
         f.write(f"Fuzzing results for {binary_name}\n")
         f.write(f"="*50 + "\n\n")
@@ -484,35 +513,68 @@ def save_results(binary_name, crashes):
                 f.write(f"  Output (hex): {crash['output'].hex()[:400]}\n")
             f.write("\n")
     
-    print(f"[*] Results saved to {output_file}")
+    try:
+        serializable = []
+        for crash in crashes:
+            entry = crash.copy()
+            if isinstance(entry.get("input"), (bytes, bytearray)):
+                entry["input_hex"] = entry["input"].hex()
+                entry.pop("input", None)
+            if isinstance(entry.get("output"), (bytes, bytearray)):
+                entry["output_hex"] = entry["output"].hex()
+                entry.pop("output", None)
+            serializable.append(entry)
+        with open(json_file, "w") as jf:
+            json.dump({"target": binary_name, "crash_count": len(crashes), "crashes": serializable}, jf, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to write JSON summary: {e}")
+    print(f"[*] Results saved to {output_file} (and {json_file})")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Simple multi-format fuzzer runner")
+    parser.add_argument("-t", "--target", help="Path to a single seed file to fuzz")
+    parser.add_argument("-b", "--binary", help="Path to the executable/script to fuzz against")
+    parser.add_argument("--max-time", type=float, default=60, help="Seconds to fuzz each target")
+    parser.add_argument("legacy", nargs="?", help="Legacy single binary name under binaries/")
+    args_ns, leftovers = parser.parse_known_args()
+    sys.argv = sys.argv[:1] + leftovers
+
     print("="*60)
     print("Starting Fuzzer")
     print("="*60)
-    
-    # Check if specific binary was requested
-    target_binary = None
-    if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
-        target_binary = sys.argv[1]
-    
-    # Get list of binaries to fuzz
-    binaries = []
-    if target_binary:
-        binary_path = BINARIES_PATH / target_binary
-        if binary_path.exists():
-            binaries = [target_binary]
-            print(f"[*] Fuzzing single binary: {target_binary}")
-        else:
-            print(f"[!] Binary not found: {target_binary}")
+
+    target_entries = []  # list of tuples (display_name, input_path, binary_override)
+    if args_ns.target:
+        input_path = Path(args_ns.target)
+        if not input_path.exists():
+            print(f"[!] Target seed not found: {input_path}")
             return 1
+        if not args_ns.binary:
+            print("[!] --binary is required when fuzzing an explicit --target file")
+            return 1
+        if args_ns.binary and not Path(args_ns.binary).exists():
+            print(f"[!] Binary not found: {args_ns.binary}")
+            return 1
+        target_entries.append((input_path.name, input_path, args_ns.binary))
+        print(f"[*] Fuzzing single seed file: {input_path}")
+    elif args_ns.legacy:
+        legacy_name = args_ns.legacy
+        binary_path = BINARIES_PATH / legacy_name
+        if not binary_path.exists():
+            print(f"[!] Binary not found: {legacy_name}")
+            return 1
+        if args_ns.binary and not Path(args_ns.binary).exists():
+            print(f"[!] Binary not found: {args_ns.binary}")
+            return 1
+        target_entries.append((legacy_name, None, args_ns.binary))
+        print(f"[*] Fuzzing single binary: {legacy_name}")
     else:
-        # Fuzz all binaries
         binaries = [f.name for f in BINARIES_PATH.iterdir() if f.is_file()]
         binaries.sort()
-        print(f"[*] Fuzzing all binaries ({len(binaries)} total)")
-    
+        target_entries = [(name, None, None) for name in binaries]
+        print(f"[*] Fuzzing all binaries ({len(target_entries)} total)")
+
     # Determine parallelism:
     # - If FUZZ_PARALLEL env is set, use it.
     # - Otherwise default to os.cpu_count() (logical CPUs) capped by number of binaries.
@@ -525,21 +587,20 @@ def main() -> int:
         except Exception:
             workers = 1
     else:
-        # default: use up to cpu_count workers, but not more than number of binaries
-        workers = min(max(1, cpu), max(1, len(binaries)))
+        workers = min(max(1, cpu), max(1, len(target_entries)))
     # Hard cap for safety during testing
     HARD_WORKER_LIMIT = 2
     workers_before_cap = workers
-    workers = max(1, min(workers, HARD_WORKER_LIMIT, len(binaries)))
-    print(f"[*] Binaries to fuzz: {binaries}", flush=True)
+    workers = max(1, min(workers, HARD_WORKER_LIMIT, len(target_entries)))
+    print(f"[*] Targets to fuzz: {[name for name, _, _ in target_entries]}", flush=True)
     print(f"[*] System logical CPUs (os.cpu_count()) = {cpu}", flush=True)
     print(f"[*] FUZZ_PARALLEL env='{workers_env}' -> requested={workers_before_cap}, using_workers={workers} (hard cap {HARD_WORKER_LIMIT})", flush=True)
 
     if workers <= 1:
         # Serial (existing) behavior
-        for binary_name in binaries:
+        for binary_name, input_path, binary_override in target_entries:
             try:
-                crashes = fuzz_binary(binary_name, max_time=60)
+                crashes = fuzz_binary(binary_name, max_time=args_ns.max_time, input_path=input_path, binary_override=binary_override)
                 save_results(binary_name, crashes)
             except Exception as e:
                 print(f"[!] Error fuzzing {binary_name}: {e}")
@@ -548,9 +609,9 @@ def main() -> int:
     else:
         # Parallel execution across binaries
         print(f"[*] Running fuzzing in parallel with {workers} workers")
-        def _worker_task(name):
+        def _worker_task(name, ipath, binary_override):
             try:
-                crashes = fuzz_binary(name, max_time=60)
+                crashes = fuzz_binary(name, max_time=args_ns.max_time, input_path=ipath, binary_override=binary_override)
                 save_results(name, crashes)
             except Exception as e:
                 print(f"[!] Error fuzzing {name}: {e}")
@@ -558,7 +619,7 @@ def main() -> int:
                 traceback.print_exc()
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = { ex.submit(_worker_task, name): name for name in binaries }
+            futures = { ex.submit(_worker_task, name, ipath, bover): name for name, ipath, bover in target_entries }
             for fut in as_completed(futures):
                 name = futures[fut]
                 try:
