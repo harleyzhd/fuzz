@@ -448,7 +448,7 @@ def fuzz_binary(binary_name, max_time=50):
 def save_results(binary_name, crashes):
     """Save fuzzing results to output file."""
     OUTPUT_PATH.mkdir(exist_ok=True)
-    output_file = OUTPUT_PATH / f"{binary_name}.txt"
+    output_file = OUTPUT_PATH / f"bad_{binary_name}.txt"
     
     with open(output_file, 'w') as f:
         f.write(f"Fuzzing results for {binary_name}\n")
