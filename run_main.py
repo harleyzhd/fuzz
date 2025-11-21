@@ -9,6 +9,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal
 from pathlib import Path
 from pwn import process, remote, gdb, args, context, u64, asm
+import ctypes
+from ctypes import c_ulonglong, c_uint, c_void_p, c_long, c_int, byref
+import tempfile
+import shutil
+import shlex
+import re
+from subprocess import PIPE, Popen, run, TimeoutExpired
 
 from fuzzers import (
     BaseFuzzer,
@@ -145,20 +152,161 @@ def describe_exit(result):
 
 
 # generator / backpressure / safety config
-GENERATOR_YIELD_TIMEOUT = float(os.environ.get("GENERATOR_YIELD_TIMEOUT", "5.0"))
 GEN_QUEUE_MAX = int(os.environ.get("GEN_QUEUE_MAX", "4"))
 MAX_MUTATED_SIZE = int(os.environ.get("MAX_MUTATED_SIZE", str(200_000)))
-ITER_SLEEP = float(os.environ.get("ITER_SLEEP", "0.0"))
+
+# ptrace constants & helper (minimal prototype)
+PTRACE_TRACEME = 0
+PTRACE_PEEKDATA = 2
+PTRACE_POKEDATA = 5
+PTRACE_CONT = 7
+PTRACE_SINGLESTEP = 9
+PTRACE_GETREGS = 12
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.ptrace.restype = c_long
+libc.ptrace.argtypes = [c_uint, c_uint, c_void_p, c_void_p]
+
+class user_regs_struct(ctypes.Structure):
+    _fields_ = [
+        ("r15", c_ulonglong),
+        ("r14", c_ulonglong),
+        ("r13", c_ulonglong),
+        ("r12", c_ulonglong),
+        ("rbp", c_ulonglong),
+        ("rbx", c_ulonglong),
+        ("r11", c_ulonglong),
+        ("r10", c_ulonglong),
+        ("r9", c_ulonglong),
+        ("r8", c_ulonglong),
+        ("rax", c_ulonglong),
+        ("rcx", c_ulonglong),
+        ("rdx", c_ulonglong),
+        ("rsi", c_ulonglong),
+        ("rdi", c_ulonglong),
+        ("orig_rax", c_ulonglong),
+        ("rip", c_ulonglong),
+        ("cs", c_ulonglong),
+        ("eflags", c_ulonglong),
+        ("rsp", c_ulonglong),
+        ("ss", c_ulonglong),
+        ("fs_base", c_ulonglong),
+        ("gs_base", c_ulonglong),
+        ("ds", c_ulonglong),
+        ("es", c_ulonglong),
+        ("fs", c_ulonglong),
+        ("gs", c_ulonglong),
+    ]
+
+def _run_with_ptrace_coverage(binary_path: str, input_bytes: bytes, step_limit: int = 2000, timeout: float = 1.0):
+    """Run the external ptrace helper as a separate process to avoid forking from multithreaded fuzzer.
+    Returns (exit_code, set_of_rips, aborted_flag). The helper prints JSON: {"rc": <int|null>, "rips":[ "0x...","..." ], "aborted": bool }"""
+    helper = Path(__file__).parent / "coverage_ptrace_runner.py"
+    if not helper.exists():
+        return (None, set(), False)
+
+    try:
+        proc = Popen([sys.executable, str(helper), str(binary_path), str(step_limit), str(timeout)],
+                     stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        out, err = proc.communicate(input=input_bytes, timeout=timeout + 1.0)
+        try:
+            decoded = out.decode('utf-8', errors='ignore').strip()
+            if not decoded:
+                return (None, set(), False)
+            obj = json.loads(decoded)
+            rc = obj.get("rc", None)
+            rips = obj.get("rips", []) or []
+            aborted = bool(obj.get("aborted", False))
+            cov = set()
+            for h in rips:
+                try:
+                    cov.add(int(h, 16))
+                except Exception:
+                    try:
+                        cov.add(int(str(h), 0))
+                    except Exception:
+                        pass
+            return (rc, cov, aborted)
+        except Exception:
+            return (None, set(), False)
+    except TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return (None, set(), True)
+    except Exception:
+        return (None, set(), False)
+
+def _run_with_perf_coverage(binary_path: str, input_bytes: bytes, freq: int = 200, timeout: float = 1.0):
+    """Run binary under `perf record` and parse `perf script` output to extract sampled IP addresses.
+    Returns (exit_code, set_of_ips). This requires `perf` installed and accessible.
+    This is a pragmatic backend — faster than ptrace single-step in many cases, but still heavier than DBI.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="fuzz_perf_")
+    perf_data = os.path.join(tmpdir, "perf.data")
+    try:
+        # Build perf record command
+        # -F freq (samples per second), -o perf.data, -- to separate perf args and command
+        cmd = ["perf", "record", "-F", str(freq), "-o", perf_data, "--", binary_path]
+        try:
+            # Run under a subprocess; supply input_bytes via stdin; capture returncode
+            proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+            try:
+                out, err = proc.communicate(input=input_bytes, timeout=timeout)
+            except TimeoutExpired:
+                # Timeout: kill perf (and child) and attempt to collect whatever
+                proc.kill()
+                try:
+                    out, err = proc.communicate(timeout=0.5)
+                except Exception:
+                    out, err = b"", b""
+                # treat as timeout
+                rc = None
+                cov = set()
+                return (rc, cov)
+            rc = proc.returncode
+        except FileNotFoundError:
+            # perf not installed
+            return (None, set())
+
+        # Now parse perf script
+        try:
+            ps = run(["perf", "script", "-i", perf_data], stdout=PIPE, stderr=PIPE, timeout=5.0)
+            script_out = ps.stdout.decode("utf-8", errors="ignore")
+        except Exception:
+            script_out = ""
+        # Extract hex tokens like 4005d0 or 0x4005d0; we'll normalize to int
+        ips = set()
+        # regex: 0x... or hex sequence at end of token
+        for m in re.finditer(r'0x[0-9a-fA-F]+', script_out):
+            try:
+                ips.add(int(m.group(0), 16))
+            except Exception:
+                continue
+        # also match bare hex like `4005d0` preceded by space and followed by :
+        for m in re.finditer(r'\s([0-9a-fA-F]{3,16}):', script_out):
+            try:
+                ips.add(int(m.group(1), 16))
+            except Exception:
+                continue
+        return (rc, ips)
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
 
 def _start_generator_thread(gen, q, stop_event, name):
     """Start one daemon thread per binary: pull from gen and push ('value', item)
-    or ('stop', None) / ('error', exc) into q. Use timeouts on q.put so thread
-    can exit promptly when stop_event is set."""
+    or ('stop', None) / ('error', exc) into q. Uses q.put with timeout so thread
+    can exit when stop_event is set."""
     def runner():
         try:
             while True:
                 item = next(gen)
-                # try to enqueue, but break if stop requested
+                # enqueue with timeout so we can check stop_event periodically
                 while not stop_event.is_set():
                     try:
                         q.put(('value', item), timeout=1.0)
@@ -168,6 +316,7 @@ def _start_generator_thread(gen, q, stop_event, name):
                 if stop_event.is_set():
                     return
         except StopIteration:
+            # try to push stop marker (non-blocking with timeouts)
             while not stop_event.is_set():
                 try:
                     q.put(('stop', None), timeout=1.0)
@@ -188,14 +337,20 @@ def _start_generator_thread(gen, q, stop_event, name):
     t.start()
     try:
         print(f"[GEN THREAD START] time={time.time():.3f} gen_id={id(gen)} thread={t.name} active={threading.active_count()}", flush=True)
-        print(f"[GEN THREAD MAP] pid={os.getpid()} thread_name={t.name} thread_ident={t.ident} -> binary={name}", flush=True)
+        try:
+            print(f"[GEN THREAD MAP] pid={os.getpid()} thread_name={t.name} thread_ident={t.ident} -> binary={name}", flush=True)
+        except Exception:
+            pass
     except Exception:
         pass
     return t
 
+
 def _get_from_queue(q, timeout, gen_id=None, tname=None):
+    """Get an item from q with timeout; print a concise timeout line for visibility."""
     try:
-        return q.get(timeout=timeout)
+        item = q.get(timeout=timeout)
+        return item
     except queue.Empty:
         try:
             print(f"[GEN THREAD TIMEOUT] time={time.time():.3f} gen_id={gen_id} thread={tname} timeout={timeout}s", flush=True)
@@ -205,80 +360,53 @@ def _get_from_queue(q, timeout, gen_id=None, tname=None):
 
 
 def fuzz_binary(binary_name, max_time=50):
+    """
+    Simplified fuzz loop: iterate fuzzer.generate(), optionally collect coverage
+    (perf preferred, ptrace fallback), accumulate unique PCs (cov_total),
+    and fall back to the original process-run behavior when coverage backends
+    don't produce results.
+    """
     print(f"\n[*] Fuzzing binary: {binary_name}")
-    
+
     # Load the valid input
     input_file = INPUTS_PATH / f"{binary_name}.txt"
     if not input_file.exists():
         print(f"[!] No example input found for {binary_name}")
         return []
-    
+
     with open(input_file, 'rb') as f:
         valid_input = f.read()
-    
+
     print(f"[*] Loaded valid input ({len(valid_input)} bytes)")
-    
+
     # Detect input type
     input_type = detect_input_type(valid_input)
     print(f"[*] Detected input type: {input_type}")
-    
+
     # Get appropriate fuzzer class and instantiate it
     fuzzer_class = get_fuzzer_class(input_type)
     print(f"[*] Using fuzzer: {fuzzer_class.__name__}")
-    
+
     try:
         fuzzer = fuzzer_class(valid_input)
     except Exception as e:
         print(f"[!] Error initializing fuzzer: {e}")
         return []
-    
+
     crashes = []
     iterations = 0
     start_time = time.time()
-    
-    # Start a bounded producer thread for this binary's generator
-    gen = fuzzer.generate()
-    gen_queue = queue.Queue(maxsize=GEN_QUEUE_MAX)
-    gen_stop_event = threading.Event()
-    print(f"[GEN QUEUE] binary={binary_name} queue_max={GEN_QUEUE_MAX}, max_mutated_size={MAX_MUTATED_SIZE}, iter_sleep={ITER_SLEEP}", flush=True)
-    gen_thread = _start_generator_thread(gen, gen_queue, gen_stop_event, name=binary_name)
-    try:
-        print(f"[THREADS SNAPSHOT] pid={os.getpid()} threads={[ (t.name, t.ident) for t in threading.enumerate() ]}", flush=True)
-    except Exception:
-        pass
 
-    while True:
-        kind, val = _get_from_queue(gen_queue, GENERATOR_YIELD_TIMEOUT, gen_id=id(gen), tname=gen_thread.name)
-        if kind == 'timeout':
-            print(f"[!] Fuzzer generator timed out after {GENERATOR_YIELD_TIMEOUT}s — skipping {binary_name}")
-            try:
-                gen.close()
-            except Exception:
-                pass
-            gen_stop_event.set()
-            try:
-                gen_thread.join(timeout=2.0)
-            except Exception:
-                pass
-            return crashes
-        if kind == 'stop':
-            gen_stop_event.set()
-            try:
-                gen_thread.join(timeout=2.0)
-            except Exception:
-                pass
+    # accumulate unique instruction addresses (program counters) seen across all iterations
+    cov_total = set()
+ 
+    # Simple generator loop (original-style)
+    for mutated in fuzzer.generate():
+        # time budget
+        if (time.time() - start_time) >= max_time:
             break
-        if kind == 'error':
-            print(f"[!] Error from fuzzer generator: {val}")
-            gen_stop_event.set()
-            try:
-                gen_thread.join(timeout=2.0)
-            except Exception:
-                pass
-            return crashes
 
-        mutated = val
-        # coerce to bytes and truncate very large payloads
+        # ensure mutated is bytes and bounded
         try:
             if isinstance(mutated, (bytes, bytearray)):
                 if len(mutated) > MAX_MUTATED_SIZE:
@@ -291,11 +419,8 @@ def fuzz_binary(binary_name, max_time=50):
         except Exception:
             mutated = b""
 
-        if (time.time() - start_time) >= max_time:
-            break
-
         iterations += 1
-        
+
         if DEBUG_PRINT_PAYLOADS:
             try:
                 plen = len(mutated) if isinstance(mutated, (bytes, bytearray)) else 0
@@ -305,59 +430,102 @@ def fuzz_binary(binary_name, max_time=50):
             if plen and plen <= 100:
                 print(f"[DEBUG] Payload: {mutated}")
             else:
-                print(f"[DEBUG] Payload (first 100 bytes): {mutated[:100]}...")
-        
+                try:
+                    print(f"[DEBUG] Payload (first 100 bytes): {mutated[:100]}...")
+                except Exception:
+                    pass
+
+        # Use ptrace helper directly for coverage
+        binary_path = str((BINARIES_PATH / binary_name).resolve())
+        cov = set()
+        rc = None
+        aborted = False
+        rc, cov, aborted = _run_with_ptrace_coverage(
+            binary_path,
+            mutated,
+            step_limit=int(os.environ.get("COV_STEP_LIMIT", "2000")),
+            timeout=float(os.environ.get("COV_TIMEOUT", "1.0")),
+        )
+
+        # accumulate unique coverage
+        try:
+            if cov:
+                cov_total.update(cov)
+        except Exception:
+            pass
+
+        # Prefer coverage-run exit code if it indicates a crash (and wasn't aborted).
+        # Otherwise *always* run the target normally to detect crashes as the original runner did.
+        if (not aborted) and (rc is not None and isinstance(rc, int) and rc != 0 and rc != 1):
+            # Coverage-run reported a crash
+            desc = describe_exit(rc)
+            crashes.append({
+                'iteration': iterations,
+                'exit_code': rc,
+                'desc': desc,
+                'input': mutated,
+                'cov': cov,
+                'total_cov': len(cov_total),
+            })
+            print(f"[+] Crash found! {desc}, Iteration: {iterations} unique_cov={len(cov_total)}", flush=True)
+            try:
+                if cov:
+                    cov_list = sorted(list(cov))[:8]
+                    print(f"    coverage (sample): {', '.join(hex(x) for x in cov_list)}", flush=True)
+            except Exception:
+                pass
+            return crashes
+
+        # Run the target normally (pwntools process) to detect crashes reliably.
         try:
             p = start(binary_name)
-            p.send(mutated)
-            p.shutdown('send')
-            
+            try:
+                if mutated:
+                    p.send(mutated)
+                p.shutdown('send')
+            except Exception:
+                pass
+
             try:
                 if hasattr(p, 'poll'):
                     result = p.poll(block=False)  # type: ignore
                     if result is None:
-                        time.sleep(0.1)
-                        result = p.poll(block=False)  # type: ignore
-
-                    # treat as crash if non-zero exit (except 1)
+                        # short wait like original
+                        time.sleep(1.5)
+                        result = p.poll(block=False)
                     if result is not None and result != 0 and result != 1:
                         desc = describe_exit(result)
-                        preview = b""
+                        out = b""
                         try:
-                            preview = p.recvall(timeout=0.1)
+                            out = p.recvall(timeout=0.2)
                         except Exception:
                             try:
-                                preview = p.recv(timeout=0.1)
+                                out = p.recv(timeout=0.05)
                             except Exception:
-                                preview = b""
+                                out = b""
                         crashes.append({
                             'input': mutated,
                             'exit_code': result,
                             'iteration': iterations,
                             'desc': desc,
-                            'output': preview
+                            'output': out,
+                            'total_cov': len(cov_total)
                         })
-                        print(f"[+] Crash found! {desc}, Iteration: {iterations}")
+                        print(f"[+] Crash found! {desc}, Iteration: {iterations} unique_cov={len(cov_total)}")
                         try:
                             p.close()
-                        except Exception:
-                            pass
-                        gen_stop_event.set()
-                        try:
-                            gen_thread.join(timeout=2.0)
                         except Exception:
                             pass
                         return crashes
             except Exception:
                 pass
-            
+
             try:
                 p.close()
             except Exception:
                 pass
-            if ITER_SLEEP and ITER_SLEEP > 0:
-                time.sleep(ITER_SLEEP)
         except Exception as e:
+            # best-effort crash detection for exceptions while starting/communicating
             if "SIGSEGV" in str(e) or "SIGABRT" in str(e) or "SIGILL" in str(e):
                 crashes.append({
                     'input': mutated,
@@ -365,57 +533,67 @@ def fuzz_binary(binary_name, max_time=50):
                     'iteration': iterations
                 })
                 print(f"[+] Crash found! Error: {str(e)[:50]}, Iteration: {iterations}")
-                gen_stop_event.set()
-                try:
-                    gen_thread.join(timeout=2.0)
-                except Exception:
-                    pass
                 return crashes
 
-        if iterations % 100 == 0:
-            print(f"[*] Iterations: {iterations}, Time: {int(time.time() - start_time)}s")
-    
-    # ensure generator thread cleaned up
+    # Final crash report
+    if crashes:
+        print(f"\n[*] Fuzzing completed with {len(crashes)} potential crashes detected")
+        for i, crash in enumerate(crashes, 1):
+            print(f"  Crash #{i}: Iteration {crash['iteration']}, Exit code {crash.get('exit_code')}, Description: {crash.get('desc')}")
+    else:
+        print(f"\n[*] Fuzzing completed with no crashes detected")
+
+    # Print total unique coverage count (pcs = program counters / instruction addresses)
     try:
-        gen_stop_event.set()
-        gen_thread.join(timeout=2.0)
-        if gen_thread.is_alive():
-            print(f"[WARN] gen thread for {binary_name} still alive at end", flush=True)
+        print(f"[COV TOTAL] binary={binary_name} unique_pcs={len(cov_total)}", flush=True)
     except Exception:
         pass
-    print(f"[*] Finished fuzzing {binary_name}: {iterations} iterations, {len(crashes)} crashes")
+
     return crashes
 
 
 def save_results(binary_name, crashes):
+    """Save fuzzing results to output file."""
     OUTPUT_PATH.mkdir(exist_ok=True)
     output_file = OUTPUT_PATH / f"{binary_name}.txt"
-    
+
     with open(output_file, 'w') as f:
         f.write(f"Fuzzing results for {binary_name}\n")
-        f.write(f"="*50 + "\n\n")
+        f.write("="*50 + "\n\n")
         f.write(f"Total crashes found: {len(crashes)}\n\n")
-        
+
         for i, crash in enumerate(crashes, 1):
             f.write(f"Crash #{i}:\n")
-            f.write(f"  Iteration: {crash['iteration']}\n")
+            f.write(f"  Iteration: {crash.get('iteration')}\n")
             if 'exit_code' in crash:
                 f.write(f"  Exit code: {crash['exit_code']}\n")
+            # include unique coverage count if available
+            if 'total_cov' in crash:
+                f.write(f"  Unique coverage (pcs): {crash['total_cov']}\n")
             if 'desc' in crash:
                 f.write(f"  Description: {crash['desc']}\n")
             if 'error' in crash:
                 f.write(f"  Error: {crash['error']}\n")
-            f.write(f"  Input (hex): {crash['input'].hex()}\n")
-            f.write(f"  Input (repr): {repr(crash['input'][:100])}\n")
+            try:
+                f.write(f"  Input (hex): {crash['input'].hex()}\n")
+            except Exception:
+                f.write(f"  Input (hex): <unavailable>\n")
+            try:
+                f.write(f"  Input (repr): {repr(crash['input'][:100])}\n")
+            except Exception:
+                f.write(f"  Input (repr): <unavailable>\n")
             if 'output' in crash and isinstance(crash['output'], (bytes, bytearray)):
                 try:
                     out_preview = crash['output'].decode('utf-8', errors='ignore').replace("\n","\\n")
                 except Exception:
                     out_preview = "<binary output>"
                 f.write(f"  Output (repr): {repr(out_preview[:200])}\n")
-                f.write(f"  Output (hex): {crash['output'].hex()[:400]}\n")
+                try:
+                    f.write(f"  Output (hex): {crash['output'].hex()[:400]}\n")
+                except Exception:
+                    f.write(f"  Output (hex): <unavailable>\n")
             f.write("\n")
-    
+
     print(f"[*] Results saved to {output_file}")
 
 
@@ -423,11 +601,13 @@ def main() -> int:
     print("="*60)
     print("Starting Fuzzer")
     print("="*60)
-    
+
+    # Check if specific binary was requested
     target_binary = None
     if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
         target_binary = sys.argv[1]
-    
+
+    # Get list of binaries to fuzz
     binaries = []
     if target_binary:
         binary_path = BINARIES_PATH / target_binary
@@ -441,35 +621,34 @@ def main() -> int:
         binaries = [f.name for f in BINARIES_PATH.iterdir() if f.is_file()]
         binaries.sort()
         print(f"[*] Fuzzing all binaries ({len(binaries)} total)")
-    
-    # use the number of logical CPUs as thread amount
+
+    # use the number of logical CPUs as worker count
     cpu = os.cpu_count() or 1
-    threads = cpu if cpu >= 1 else 1
-    print(f"[*] Binaries to fuzz: {binaries}", flush=True)
+    workers = cpu if cpu >= 1 else 1
     print(f"[*] System logical CPUs (os.cpu_count()) = {cpu}", flush=True)
-    print(f"[*] Using threads = {threads}", flush=True)
-    
-    if threads <= 1:
+    print(f"[*] Using workers = {workers}", flush=True)
+
+    if workers <= 1:
         for binary_name in binaries:
             try:
-                crashes = fuzz_binary(binary_name, max_time=60)
+                crashes = fuzz_binary(binary_name, max_time=600)
                 save_results(binary_name, crashes)
             except Exception as e:
                 print(f"[!] Error fuzzing {binary_name}: {e}")
                 import traceback
                 traceback.print_exc()
     else:
-        print(f"[*] Running fuzzing in parallel with {threads} threads")
+        print(f"[*] Running fuzzing in parallel with {workers} workers")
         def _worker_task(name):
             try:
-                crashes = fuzz_binary(name, max_time=60)
+                crashes = fuzz_binary(name, max_time=600)
                 save_results(name, crashes)
             except Exception as e:
                 print(f"[!] Error fuzzing {name}: {e}")
                 import traceback
                 traceback.print_exc()
 
-        with ThreadPoolExecutor(max_workers=threads) as ex:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = { ex.submit(_worker_task, name): name for name in binaries }
             for fut in as_completed(futures):
                 name = futures[fut]
@@ -478,9 +657,9 @@ def main() -> int:
                     print(f"[*] Finished {name}")
                 except Exception as e:
                     print(f"[!] Worker error for {name}: {e}")
-    
+
     print("\n" + "="*60)
-    print("Fuzzing completed successfully")
+    print("Fuzzing completed")
     print("="*60)
     return 0
 
