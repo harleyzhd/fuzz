@@ -6,9 +6,10 @@ RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/
 
 RUN pip install pwntools pikepdf pyelftools
 
-# Copy/Compile my fuzzer
+# Copy fuzzer code and dependencies
 COPY fuzzer /
 COPY run_main.py /
+COPY fuzzers/ /fuzzers/
 RUN chmod +x /fuzzer
 
 # Run it via the bash wrapper (which calls python3 /run_main.py)
