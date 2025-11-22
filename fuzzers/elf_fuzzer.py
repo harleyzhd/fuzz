@@ -661,6 +661,247 @@ class ElfFuzzer(BaseFuzzer):
         
         return bytes(data)
     
+    def _rebuild_string_table_with_pattern(self, data, pattern_type):
+        # helper function to rebuild string table with specific heap allocation patterns
+        if not self.elf_obj:
+            return data
+        
+        data = bytearray(data)
+        
+        try:
+            e_shoff = struct.unpack('<Q', data[0x28:0x30])[0]
+            e_shnum = struct.unpack('<H', data[0x3c:0x3e])[0]
+            e_shentsize = struct.unpack('<H', data[0x3a:0x3c])[0]
+            e_shstrndx = struct.unpack('<H', data[0x3e:0x40])[0]
+            
+            if e_shoff == 0 or e_shnum == 0 or e_shstrndx >= e_shnum:
+                return bytes(data)
+            
+            # get the section header string table
+            shstrtab_hdr_offset = e_shoff + (e_shstrndx * e_shentsize)
+            shstrtab_offset = struct.unpack('<Q', data[shstrtab_hdr_offset + 0x18:shstrtab_hdr_offset + 0x20])[0]
+            shstrtab_size = struct.unpack('<Q', data[shstrtab_hdr_offset + 0x20:shstrtab_hdr_offset + 0x28])[0]
+            
+            if shstrtab_offset >= len(data) or shstrtab_size == 0:
+                return bytes(data)
+            
+            crafted_names = []
+            
+            if pattern_type == 'off_by_one':
+                # names with lengths just under power-of-2 boundaries
+                # triggers off-by-one when allocator rounds up
+                for length in [7, 15, 23, 31, 39, 47, 55, 63, 127]:
+                    name = random.choice([b'A', b'X', b'Z']) * length
+                    crafted_names.append(name)
+            
+            elif pattern_type == 'same_size':
+                same_length = random.choice([15, 23, 31, 47, 63])
+                for i in range(min(e_shnum, 50)):
+                    char = chr(ord('A') + (i % 26)).encode()
+                    name = char * same_length
+                    crafted_names.append(name)
+            
+            elif pattern_type == 'alternating':
+                for i in range(min(e_shnum, 40)):
+                    if i % 2 == 0:
+                        name = b'S' * 15
+                    else:
+                        name = b'L' * 127
+                    crafted_names.append(name)
+            
+            elif pattern_type == 'graduated':
+                for i in range(min(e_shnum, 30)):
+                    length = 7 + (i * 4)
+                    name = b'G' * min(length, 127)
+                    crafted_names.append(name)
+            
+            elif pattern_type == 'exhaustive':
+                for i in range(min(e_shnum, 20)):
+                    length = random.choice([100, 200, 500, 1000])
+                    name = b'C' * length
+                    crafted_names.append(name)
+            
+            elif pattern_type == 'varied':
+                lengths = [8, 16, 24, 32, 48, 64, 15, 31, 47, 63]
+                for i in range(min(e_shnum, len(lengths) * 3)):
+                    length = lengths[i % len(lengths)]
+                    name = b'V' * length
+                    crafted_names.append(name)
+            
+            else:
+                return bytes(data)
+            
+            # rebuild the string table with crafted names
+            new_strtab = bytearray(b'\x00')
+            name_offsets = [0] 
+            
+            for i, name in enumerate(crafted_names):
+                if i + 1 >= e_shnum:
+                    break
+                offset = len(new_strtab)
+                name_offsets.append(offset)
+                new_strtab.extend(name + b'\x00')
+            
+            # pad to original size or larger
+            target_size = max(shstrtab_size, len(new_strtab))
+            while len(new_strtab) < target_size:
+                new_strtab.append(0)
+            
+            # replace the string table
+            end_pos = min(shstrtab_offset + len(new_strtab), len(data))
+            data[shstrtab_offset:end_pos] = new_strtab[:end_pos - shstrtab_offset]
+            
+            # update section header name indices
+            for i in range(min(len(name_offsets), e_shnum)):
+                sh_offset = e_shoff + (i * e_shentsize)
+                if i < len(name_offsets) and sh_offset + 4 <= len(data):
+                    struct.pack_into('<I', data, sh_offset, name_offsets[i])
+        
+        except Exception:
+            pass
+        
+        return bytes(data)
+    
+    def _mutate_section_names(self, data):
+        # mutate section name lengths and content to trigger various heap issues
+        # random heap exploitation pattern
+        patterns = ['off_by_one', 'same_size', 'alternating', 'graduated', 'exhaustive', 'varied']
+        pattern = random.choice(patterns)
+        return self._rebuild_string_table_with_pattern(data, pattern)
+    
+    def _create_many_sections(self, data):
+        # create many sections to increase heap allocation pressure
+        if not self.elf_obj:
+            return data
+        
+        data = bytearray(data)
+        
+        try:
+            e_shoff = struct.unpack('<Q', data[0x28:0x30])[0]
+            e_shnum = struct.unpack('<H', data[0x3c:0x3e])[0]
+            e_shentsize = struct.unpack('<H', data[0x3a:0x3c])[0]
+            
+            if e_shoff == 0:
+                return bytes(data)
+            
+            # add many dummy sections to force many heap allocations
+            # this can trigger UAF issues when the program tries to cleanup/access them
+            num_new_sections = random.randint(30, 100)
+            
+            for i in range(num_new_sections):
+                dummy_sh = bytearray(e_shentsize)
+                struct.pack_into('<I', dummy_sh, 0x00, random.randint(0, 200))  # sh_name
+                struct.pack_into('<I', dummy_sh, 0x04, random.choice([1, 2, 3, 8]))  # sh_type
+                struct.pack_into('<Q', dummy_sh, 0x08, random.choice([0x3, 0x6, 0x7]))  # sh_flags
+                struct.pack_into('<Q', dummy_sh, 0x10, 0)  # sh_addr
+                struct.pack_into('<Q', dummy_sh, 0x18, len(data))  # sh_offset
+                struct.pack_into('<Q', dummy_sh, 0x20, random.randint(0, 1000))  # sh_size
+                struct.pack_into('<I', dummy_sh, 0x28, 0)  # sh_link
+                struct.pack_into('<I', dummy_sh, 0x2c, 0)  # sh_info
+                struct.pack_into('<Q', dummy_sh, 0x30, random.choice([1, 8, 16]))  # sh_addralign
+                struct.pack_into('<Q', dummy_sh, 0x38, 0)  # sh_entsize
+                
+                # append to end of section header table
+                append_pos = e_shoff + (e_shnum * e_shentsize)
+                data[append_pos:append_pos] = dummy_sh
+                e_shnum += 1
+            
+            # update section count
+            struct.pack_into('<H', data, 0x3c, e_shnum)
+        
+        except Exception:
+            pass
+        
+        return bytes(data)
+    
+    def _corrupt_section_order(self, data):
+        # manipulate section ordering and properties to trigger memory corruption
+
+        if not self.elf_obj:
+            return data
+        
+        data = bytearray(data)
+        
+        try:
+            e_shoff = struct.unpack('<Q', data[0x28:0x30])[0]
+            e_shnum = struct.unpack('<H', data[0x3c:0x3e])[0]
+            e_shentsize = struct.unpack('<H', data[0x3a:0x3c])[0]
+            e_shstrndx = struct.unpack('<H', data[0x3e:0x40])[0]
+            
+            if e_shoff == 0 or e_shnum < 3:
+                return bytes(data)
+            
+            corruption_type = random.randint(0, 3)
+            
+            if corruption_type == 0:
+                # swap section headers to confuse processing order
+                if e_shnum > 2:
+                    idx1 = random.randint(1, e_shnum - 1)
+                    idx2 = random.randint(1, e_shnum - 1)
+                    
+                    sh1_offset = e_shoff + (idx1 * e_shentsize)
+                    sh2_offset = e_shoff + (idx2 * e_shentsize)
+                    
+                    if sh1_offset + e_shentsize <= len(data) and sh2_offset + e_shentsize <= len(data):
+                        temp = data[sh1_offset:sh1_offset + e_shentsize]
+                        data[sh1_offset:sh1_offset + e_shentsize] = data[sh2_offset:sh2_offset + e_shentsize]
+                        data[sh2_offset:sh2_offset + e_shentsize] = temp
+            
+            elif corruption_type == 1:
+                # make sections point to overlapping or invalid offsets
+                for i in range(1, min(e_shnum, 10)):
+                    sh_offset = e_shoff + (i * e_shentsize)
+                    if sh_offset + e_shentsize <= len(data):
+                        # corrupt sh_offset field
+                        offset_field = sh_offset + 0x18
+                        new_offset = random.choice([0, len(data), len(data) + 0x1000, 0xFFFFFFFF])
+                        struct.pack_into('<Q', data, offset_field, new_offset)
+            
+            elif corruption_type == 2:
+                # corrupt section sizes to trigger buffer issues
+                for i in range(1, min(e_shnum, 10)):
+                    sh_offset = e_shoff + (i * e_shentsize)
+                    if sh_offset + e_shentsize <= len(data):
+                        size_field = sh_offset + 0x20
+                        new_size = random.choice([0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFF, 1, 0])
+                        struct.pack_into('<Q', data, size_field, new_size)
+            
+            else:
+                # duplicate section entries
+                if e_shnum > 1:
+                    src_idx = random.randint(1, e_shnum - 1)
+                    dst_idx = random.randint(1, e_shnum - 1)
+                    
+                    src_offset = e_shoff + (src_idx * e_shentsize)
+                    dst_offset = e_shoff + (dst_idx * e_shentsize)
+                    
+                    if src_offset + e_shentsize <= len(data) and dst_offset + e_shentsize <= len(data):
+                        data[dst_offset:dst_offset + e_shentsize] = data[src_offset:src_offset + e_shentsize]
+        
+        except Exception:
+            pass
+        
+        return bytes(data)
+    
+    def _malformed_section_count(self, data):
+        """Set section count to extreme values to trigger allocation issues"""
+        data = bytearray(data)
+
+        new_count = random.choice([
+            0,           # no sections
+            1,           # just null section
+            0xFFFF,      # maximum value
+            0x7FFF,      # half max
+            100,         # many but reasonable
+            500,         # many sections
+            1000,
+            5000,
+            random.randint(50, 200),
+        ])
+        struct.pack_into('<H', data, 0x3c, new_count)
+        
+        return bytes(data)
+    
     def generate(self):
         yield b""
         yield b"\x7fELF"                    # just magic bytes
@@ -699,6 +940,19 @@ class ElfFuzzer(BaseFuzzer):
         # ELF header mutations
         for _ in range(40):
             yield self._mutate_elf_header(self.example_input)
+        
+        for _ in range(60):
+            yield self._mutate_section_names(self.example_input)
+
+        for _ in range(30):
+            yield self._create_many_sections(self.example_input)
+
+        for _ in range(40):
+            yield self._corrupt_section_order(self.example_input)
+        
+        # Malformed section counts
+        for _ in range(20):
+            yield self._malformed_section_count(self.example_input)
         
         # program header mutations
         for _ in range(30):
@@ -743,6 +997,9 @@ class ElfFuzzer(BaseFuzzer):
                     self._mutate_section_contents,
                     self._mutate_relocations,
                     self._mutate_dynamic_section,
+                    self._mutate_section_names,
+                    self._create_many_sections,
+                    self._corrupt_section_order,
                 ])
                 mutated = mutation_func(mutated)
             
