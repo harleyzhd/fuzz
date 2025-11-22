@@ -345,11 +345,7 @@ def fuzz_binary(binary_name, max_time=50, input_path=None, binary_override=None)
 
             try:
                 if hasattr(p, 'poll'):
-                    CSV_LONG_WAIT = 1.5    # seconds
                     wait_seconds = PROCESS_TIMEOUT
-                    if input_type == 'CSV':
-                        wait_seconds = max(wait_seconds, CSV_LONG_WAIT)
-
                     poll_result = None
                     deadline = time.time() + wait_seconds
                     while time.time() < deadline:
@@ -589,7 +585,7 @@ def main() -> int:
     else:
         workers = min(max(1, cpu), max(1, len(target_entries)))
     # Hard cap for safety during testing
-    HARD_WORKER_LIMIT = 2
+    HARD_WORKER_LIMIT = 4
     workers_before_cap = workers
     workers = max(1, min(workers, HARD_WORKER_LIMIT, len(target_entries)))
     print(f"[*] Targets to fuzz: {[name for name, _, _ in target_entries]}", flush=True)
