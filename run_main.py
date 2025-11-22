@@ -393,7 +393,7 @@ def fuzz_binary(binary_name, max_time=50, input_path=None, binary_override=None)
                         except Exception:
                             pass
 
-                    if poll_result not in (None, 0):
+                    if poll_result not in (None, 0, 1):
                         desc = describe_exit(poll_result)
                         preview = ""
                         try:
@@ -483,8 +483,8 @@ def fuzz_binary(binary_name, max_time=50, input_path=None, binary_override=None)
 def save_results(binary_name, crashes):
     """Save fuzzing results to output file."""
     OUTPUT_PATH.mkdir(exist_ok=True)
-    output_file = OUTPUT_PATH / f"{binary_name}.txt"
-    json_file = OUTPUT_PATH / f"{binary_name}.json"
+    output_file = OUTPUT_PATH / f"bad_{binary_name}.txt"
+    json_file = OUTPUT_PATH / f"bad_{binary_name}.json"
 
     with open(output_file, 'w') as f:
         f.write(f"Fuzzing results for {binary_name}\n")
